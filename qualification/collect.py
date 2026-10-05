@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sequential, evidence-preserving Qwen3.8 qualification runner; never manages services."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -323,17 +324,17 @@ def run_task(task, base_url, model, api_key, timeout, max_tokens, seed, long_doc
     total_wall = 0.0
     tool_rounds = 0
     for turn in range(4):
-        body = {'model': model, 'messages': messages, 'max_tokens': max_tokens,
+        body = {'model': model, 'messages': copy.deepcopy(messages), 'max_tokens': max_tokens,
                 'temperature': 0, 'seed': seed, 'stream': False,
                 'reasoning_effort': reasoning_effort}
         if reasoning_budget is not None:
             body['reasoning_budget_tokens'] = reasoning_budget
         if task.get('tools'):
-            body['tools'] = task['tools']
+            body['tools'] = copy.deepcopy(task['tools'])
             body['tool_choice'] = 'auto'
         code, response, raw, wall = post_json(base_url.rstrip('/') + '/v1/chat/completions', body, api_key, timeout)
         total_wall += wall
-        trace.append({'turn': turn + 1, 'request': body, 'http_status': code,
+        trace.append({'turn': turn + 1, 'request': copy.deepcopy(body), 'http_status': code,
                       'response': response, 'raw_response': raw, 'wall_seconds': wall,
                       'usage': response.get('usage') if isinstance(response, dict) else None,
                       'finish_reason': ((response.get('choices') or [{}])[0].get('finish_reason')

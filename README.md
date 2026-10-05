@@ -64,7 +64,7 @@ ESP is experimental and may change output behavior. The measurements do not esta
 
 ## Qualification status
 
-A ten-task **128K long-document retrieval screen** has been recorded, alongside Chinese, code and tool baseline/candidate reviews. Manual code review identified a missing requested complexity explanation; general quality acceptance remains open. Pinned v0.1.39 source has built, with controlled pairing, longer soak and real rollback checks still in progress.
+A ten-task **128K long-document retrieval screen** has been recorded, alongside Chinese, code and tool baseline/candidate reviews. Manual code review identified a missing requested complexity explanation; general quality acceptance remains open. Pinned v0.1.39 source has built and loaded, followed by a real rollback to v0.1.38 with Vision, ESP switching and persistent usage checks. A one-hour baseline soak is running; controlled version pairing and 24-hour acceptance remain pending.
 
 ## Repository contents
 

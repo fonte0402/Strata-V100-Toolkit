@@ -20,6 +20,30 @@ def response(content=None, calls=None):
 
 
 class QualificationTests(unittest.TestCase):
+    def test_tool_trace_preserves_each_actual_request(self):
+        task = json.loads(json.dumps(self.items['tool01']))
+        call = {'id': 'local-weather', 'type': 'function', 'function': {
+            'name': 'get_weather', 'arguments': '{"city":"Tokyo","unit":"celsius"}'}}
+        answers = iter([response(calls=[call]), response('东京为晴天。')])
+        sent = []
+
+        def fake_post(url, body, key, timeout):
+            sent.append(json.loads(json.dumps(body)))
+            reply = next(answers)
+            return 200, reply, json.dumps(reply), .01
+
+        with patch('collect.post_json', side_effect=fake_post):
+            row = collect.run_task(task, 'http://127.0.0.1:1', 'test-model', None, 1, 256, 42)
+        self.assertEqual(len(row['trace']), 2)
+        self.assertEqual([turn['request'] for turn in row['trace']], sent)
+        self.assertEqual(len(row['trace'][0]['request']['messages']), 2)
+        self.assertEqual(len(row['trace'][1]['request']['messages']), 4)
+        task['tools'][0]['function']['name'] = 'changed later'
+        self.assertEqual(row['trace'][0]['request'], sent[0])
+        self.assertEqual(row['trace'][1]['request'], sent[1])
+        row['trace'][1]['request']['messages'][0]['content'] = 'changed later'
+        self.assertEqual(row['trace'][0]['request'], sent[0])
+
     @classmethod
     def setUpClass(cls):
         cls.items = {task['id']: task for task in load_and_validate()['items']}
