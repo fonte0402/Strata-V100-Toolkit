@@ -1,0 +1,6 @@
+context_tokens,effort,repeat,generated_tokens,request_wall_seconds,decode_tokens_per_second,reported_cache_hit_percent
+8192,medium,2,512,5.7,91.4,97.1
+32768,medium,2,512,5.88,88.3,96.4
+65536,medium,2,512,6.16,84.5,96.2
+131072,medium,2,512,6.44,80.8,95.0
+262144,medium,2,512,7.32,70.9,91.7

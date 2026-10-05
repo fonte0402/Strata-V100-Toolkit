@@ -1,65 +1,78 @@
-# Portable Strata toolkit
+# Strata V100 Toolkit
 
-This small Windows/Python toolkit generates a service configuration and PowerShell start/stop scripts for a relocated Strata checkout. It accepts explicit paths for the API source, engine source/binary, Python, model assets, GPU UUID, port, and protected auth-file location. Paths with spaces are supported. It never bundles models, tokenizers, packs, credentials, databases, generated run records, or source logs.
+[中文](README.zh-CN.md) · [Benchmark notes](docs/BENCHMARKS.md) · [Upstream Strata](https://github.com/Niko1221/Strata)
 
-The lifecycle controller targets Windows with Python 3.10 or newer, PowerShell, Task Scheduler, WMI/CIM access, `netstat`, and NVIDIA `nvidia-smi`. Offline config and qualification checks use the Python standard library. No engine compilation is included.
+**Qwen3.8-Flash-Next on one Tesla V100 32GB: MTP acceleration, 8K–256K contexts, Vision, an OpenAI-compatible API, and Windows web service controls.**
 
-The source is split into three independent pieces. `portable_strata/` contains the path-driven config builder and the ownership-checked service lifecycle. `qualification/` contains the allowlisted synthetic quality taskset and offline tools. `patches/` records source changes that can be applied to the exact API base; the v138 engine patch has a separate identity and directory. API-server worktree edits are not the v138 engine source.
+This project publishes measurements from an **i9-13900F + DDR4 + PCIe Gen3 x4 + Windows** workstation and packages portable service tools and source patches. Strata provides the inference engine. v0.1.38 is the current baseline; pinned v0.1.39 is under qualification.
 
-## Generate a service setup
+## Measured results
 
-Use paths from the target machine. Example paths below are illustrative and may contain spaces:
+### Historical context matrix
 
-```powershell
-$Root = '<ROOT>'
-$RuntimeRoot = '<RUNTIME_ROOT>'
-$PythonExe = '<PYTHON_EXE>'
-python .\portable_strata\config.py generate `
-  --output (Join-Path $RuntimeRoot 'service.json') `
-  --engine-root (Join-Path $Root 'engine source\build-lead') `
-  --engine-exe (Join-Path $Root 'engine source\build-lead\strata.exe') `
-  --python $PythonExe `
-  --api-root (Join-Path $Root 'API source') `
-  --auth-file (Join-Path $RuntimeRoot 'private\service_auth.json') `
-  --gpu-uuid 'GPU-REPLACE-WITH-THIS-MACHINE-UUID' `
-  --port 18100 `
-  --asset "pack=$(Join-Path $Root 'assets\pack')" `
-  --asset "native=$(Join-Path $Root 'assets\models\model.gguf')" `
-  --asset "expert_profile=$(Join-Path $Root 'assets\expert profile.bin')" `
-  --asset "mtp=$(Join-Path $Root 'assets\mtp')" `
-  --asset "tokenizer=$(Join-Path $Root 'assets\tokenizer')"
-```
+v0.1.38, original GSQ-RCO IQ3_XXS, MTP T=3, automatic expert cache:
 
-The `--auth-file` argument is a pointer only. Store the JSON file outside this repository with an `api_key` field and Windows ACLs limited to the service user. The secret itself is never read or copied during config generation. Background Task Scheduler services require this explicit file because they do not inherit the launching shell's environment. Foreground/check-only use can read `STRATA_API_KEY` from that process or the explicit file.
+| Configured context | Decode (tok/s) | Expert cache slots |
+|---|---:|---:|
+| 8K | **91.4** | 15,375 |
+| 32K | **88.3** | 14,927 |
+| 64K | **84.5** | 14,403 |
+| 128K | **80.8** | 13,317 |
+| 256K · RoPE extrapolation | **70.9** | 11,191 |
 
-Optional asset mappings are `mmproj`, `vision_exe`, and `esp`. Set `--vision` only when both vision assets are mapped; the builder places `mmproj` in the API vision config and does not pass it as an engine CLI option. Set `--esp` only with an external `esp` asset. ESP adds the control-vector flags to the engine configuration and does not set reasoning parameters; Thinking remains controlled by each API request. The default expert cache is `auto`; override with a positive integer only when the chosen engine and workload have been checked.
+Protocol: medium reasoning, 512 generated tokens, second sequential repeat; temperature 1.0, top_p 0.95, top_k 20, seed 42. Generated tokens may include reasoning. These are warm-cache fixed-output measurements, not a speed promise for every request. 256K uses extrapolation. Selected raw fields are available in the sanitized [CSV](docs/context-matrix.csv).
 
-The command writes `service.json`, `start.ps1`, and `stop.ps1` beside the chosen output file. To inspect the launch plan without checking hardware, touching a port, or starting a process:
+### Latest 128K short-request checks · 2026-10-05
 
-```powershell
-python .\portable_strata\config.py show-command --config (Join-Path $RuntimeRoot 'service.json')
-```
+v0.1.38, Vision/ESP ON, static 13,317 resident experts, adapt0, MTP T=3, 23 workers, temperature 0. One warmup per task followed by three measured repetitions: **15/15 valid records**.
 
-Review the paths, then run the generated PowerShell start or stop script. Startup gates require Windows, Task Scheduler, Python, and `nvidia-smi`. They check the selected GPU UUID, memory headroom, system commit and free port, and register the exact service process identity. Stop checks the recorded PID creation time, executable fingerprint, and port ownership before requesting shutdown; it verifies identities again before force termination. It never finds processes by a broad image-name kill. The GPU query retains UUID, NVIDIA-reported name, and used memory.
+| Task | Output tokens | Median decode (range), tok/s | Finish |
+|---|---:|---:|---|
+| Chinese answer | 98 | **30.73** (29.82–31.11) | Natural |
+| Code answer | 216 | **43.01** (41.18–45.09) | Natural |
+| Tool call | 50 | **49.63** (41.60–51.27) | tool_calls |
+| Chinese narrative | 512 | **21.07** (20.86–21.26) | Output cap |
+| Longer code | 512 | **44.13** (43.06–45.19) | Output cap |
 
-The state file, Task Scheduler arguments, service logs, and usage database live beside the selected state file/config output. Keep that runtime directory outside the Git repository. `service_control.py` has no local GPU UUID or port defaults. Managed Task Scheduler task names are unique by API root and port by default; an unrelated same-name task is refused.
+The two tables use different tasks, sampling and cache policies, so their difference does not establish a performance regression or gain. The latest checks retain complete request and generation-segment accounting. They are single-version observations; no v0.1.39 speedup is claimed yet. See [benchmark notes](docs/BENCHMARKS.md).
 
-Generated PowerShell wrappers use quoted literal paths, and the Python launcher passes arguments as a vector. GPU preflight reads `uuid,name,memory.used` and selects by UUID while retaining NVIDIA's reported name in the readiness record.
+## Tested hardware and model
 
-## Qualification tools
+| Component | Configuration |
+|---|---|
+| Inference GPU | **1× Tesla V100-PCIE-32GB / sm_70 / 32,768 MiB** |
+| PCIe | **Measured Gen3 x4** |
+| CPU | Intel Core i9-13900F · 24 cores / 32 threads (8P + 16E) |
+| RAM | **64 GiB DDR4-3600** · 4×16 GiB · dual channel |
+| Storage | Model, pack and PLE assets on NVMe |
+| OS / driver | Windows 11 Pro build 26200 / NVIDIA 581.15 |
+| Build toolchain | CUDA 12.8.61 / MSVC 14.43 |
+| Model | Qwen3.8-Flash-Next · GSQ-RCO IQ3_XXS |
+| Acceleration / API | MTP T=3 / expert cache / OpenAI-compatible API |
 
-See [qualification/README.md](qualification/README.md). The taskset is synthetic; no historical run files or original user logs are included. To create calibrated long-context material, pass both the exact serving tokenizer directory and the tokenizer implementation path from the serving source. The exported instructions have no fixed workstation drive paths. API credentials are read from the current environment only.
+An RTX 3080 handles desktop work and is excluded from this inference lane. GPU, PCIe, CPU, RAM and OS facts were rechecked during the current test window.
 
-Offline checks use only Python's standard library:
+## Working capabilities
 
-```powershell
-python -m unittest discover -s tests -v
-python -m unittest discover -s qualification -p 'test_*.py' -v
-python qualification\validate.py
-```
+- **Text / Vision profiles:** 8K, 32K, 64K, 128K and 256K. Context and vision loading are fixed at startup.
+- **Request-level Thinking and ESP:** client-selected reasoning effort; ESP loaded through the startup profile and switchable through web/API requests. Explicit request parameters override shared defaults.
+- **Web operations:** Chat, shared Sampling defaults, Monitor and **Shutdown**.
+- **Persistent token usage:** current run, today and all time; restart-safe storage and separate initial-input versus internal-continuation cache accounting.
+- **Portable service management:** relocated roots, external assets/auth files, and process-creation, fingerprint and listener ownership checks before stopping a service.
 
-These checks do not launch a model or use a GPU. Qualification collection is a separate, explicit live-endpoint operation; its JSONL and summary outputs can contain prompts or model reasoning and should stay outside Git.
+ESP is experimental and may change output behavior. The measurements do not establish zero quality impact.
 
-## Source provenance
+## Qualification status
 
-`portable_strata/service_control.py`, `guarded_start.py`, and `install_managed_task.ps1` are adapted from the frozen operational files under `phase0/`; `SOURCE_PROVENANCE.md` records their source hashes and the portable edits. They are kept separate from the API patch. API patch metadata names the base commit and hashes. v138 engine provenance is recorded independently so a dirty API Git tree is never represented as a clean v138 repository.
+A ten-task **128K long-document retrieval screen** has been recorded, alongside Chinese, code and tool baseline/candidate reviews. Manual code review identified a missing requested complexity explanation; general quality acceptance remains open. Pinned v0.1.39 source has built, with controlled pairing, longer soak and real rollback checks still in progress.
+
+## Repository contents
+
+| Directory | Contents |
+|---|---|
+| `portable_strata/` | Config generation and ownership-checked service controls |
+| `qualification/` | Synthetic quality fixtures and screening tools |
+| `patches/` | Pinned API-base and separate v138 engine patches |
+| `docs/` | Benchmark notes, sanitized CSV and service-tool usage |
+
+For usage, see [service tools](docs/TOOL_USAGE.md). Model weights, packs, tokenizers, credentials, databases and private run logs are excluded.
