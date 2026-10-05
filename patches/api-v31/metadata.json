@@ -1,0 +1,53 @@
+{
+  "base_commit": "9259cad4cfa3543cd3b8decab5962672b968c649",
+  "base_label": "Strata API v0.1.31-era source",
+  "base_is_v138_engine": false,
+  "patch_sha256": "41a02867d7c28c8c4463556e2cac2984afc528068d65ec00cc39b6117220fccc",
+  "files": [
+    {
+      "path": "serve/server.py",
+      "kind": "modified",
+      "base_blob": "af66657018125115c7cc9f6ec18ac78c1f30134d",
+      "result_sha256": "b615f136db0a1aa141b46ee6a89e885564f1d6a2917a80ed205d031304df3a63"
+    },
+    {
+      "path": "serve/web/app.css",
+      "kind": "modified",
+      "base_blob": "4e8363d4a6c8a7d9c0902288b798f78baddd6879",
+      "result_sha256": "76292ff7021751f6397281ebea899a9cac3820a6b4b970df20a283a9d620168e"
+    },
+    {
+      "path": "serve/web/app.js",
+      "kind": "modified",
+      "base_blob": "6e8fa6b293a32508ab3ddbd06b10a32481304061",
+      "result_sha256": "0a5f1347363016d9af5a03b0668520a4ed7d307694d14c4b7727a9365f85f7bb"
+    },
+    {
+      "path": "serve/web/index.html",
+      "kind": "modified",
+      "base_blob": "d858d2f08ab79cc629d62e83935981a60a708403",
+      "result_sha256": "33026e23738950315d62667ad582679355030f95042bc0cd014ce2b3b5c45d31"
+    },
+    {
+      "path": "serve/token_usage.py",
+      "kind": "added",
+      "result_sha256": "4c699bafa49aa5824af5c8dc700f88d857a302845434b6117a2df5ab903b1364"
+    },
+    {
+      "path": "serve/test_generation_accounting.py",
+      "kind": "added",
+      "result_sha256": "759b5275993a1f5136b7c898fad56cf4db944bcf669edd9a22aaf0cf12de14a9"
+    },
+    {
+      "path": "serve/test_shutdown.py",
+      "kind": "added",
+      "result_sha256": "7d47e3bf5cd8ea08b52442624251e07817e8afb553764576dd83ba55d4ffc2b2"
+    },
+    {
+      "path": "serve/test_token_usage.py",
+      "kind": "added",
+      "result_sha256": "66d0b256e4f99f5946d2f9902369d0ace27f9149025ef5d5c1e6c1b8117f631a"
+    }
+  ],
+  "generated_from": "explicit API path allowlist only"
+}

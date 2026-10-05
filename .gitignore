@@ -1,0 +1,23 @@
+# Runtime configuration may contain private local paths.
+*.local.json
+service.json
+service_state.json
+managed_task_args.json
+service.lock
+service-runs/
+logs/
+usage/
+qualification/runs/
+qualification/visual_manual_runs/
+qualification/visual_manual_comparison_*/
+qualification/visual_manual_native_comparison_*/
+qualification/*.jsonl
+qualification/*.manifest.json
+*.sqlite3
+*.key
+service_auth.json
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.verification-*/

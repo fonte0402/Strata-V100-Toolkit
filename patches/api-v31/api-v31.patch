@@ -1,0 +1,1468 @@
+diff --git a/serve/server.py b/serve/server.py
+index af66657..f05c414 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -50,6 +50,7 @@
+                             images_of, openai_to_messages)
+ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+ from serve.winjob import contain  # noqa: E402
++from serve.token_usage import TokenUsage  # noqa: E402
+ 
+ IM_END = "<|im_end|>"
+ IMAGE_PAD = "<|image_pad|>"
+@@ -102,6 +103,32 @@
+ class GpuBusy(RuntimeError):
+     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
+     model server) is using it, so the engine is not started into the little that is left."""
++
++
++class ServiceStopping(GpuBusy):
++    """Shutdown has started; no request may restart the resident engine."""
++
++
++class RequestCancel:
++    """A client cancellation combined with shutdown, also during MCP calls."""
++    def __init__(self, shutdown, client=None):
++        self.shutdown = shutdown
++        self.client = client if client is not None else threading.Event()
++
++    def set(self):
++        self.client.set()
++
++    def is_set(self):
++        return self.shutdown.is_set() or self.client.is_set()
++
++    def wait(self, timeout=None):
++        deadline = None if timeout is None else time.monotonic() + timeout
++        while not self.is_set():
++            left = .1 if deadline is None else min(.1, deadline - time.monotonic())
++            if left <= 0:
++                return self.is_set()
++            self.client.wait(left)
++        return True
+ 
+ 
+ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
+@@ -628,7 +655,7 @@
+ class Service:
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+-                 fit_max_tokens: bool = False):
++                 fit_max_tokens: bool = False, usage_db=None):
+         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+@@ -637,12 +664,16 @@
+         self.fifo = threading.Lock()
+         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
+         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
++        self.shutdown_requested = threading.Event()
+         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+         # since the server started (the Monitor's totals, issue #35)
+         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                        "prompt_ms": 0.0, "decode_ms": 0.0}
++        self.token_usage = TokenUsage(usage_db)
++        if self.token_usage.error:
++            print('[strata] token usage persistence unavailable: ' + self.token_usage.error, flush=True)
+         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+         self.last_request_at = None                      # when a request last started or finished
+         self.started_at = time.time()
+@@ -694,6 +725,8 @@
+     def ensure_loaded(self):
+         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
+         the free-VRAM check.  The caller holds self.fifo."""
++        if self.shutdown_requested.is_set():
++            raise ServiceStopping("Strata is shutting down; start it with the launcher to use it again")
+         if self.loaded() and not self._vision_down():
+             return
+         if self.before_load:
+@@ -729,6 +762,8 @@
+     def load(self):
+         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+         # a request is on its way: the idle thread must not unload between this and the request's own start
++        if self.shutdown_requested.is_set():
++            raise ServiceStopping("Strata is shutting down")
+         self.last_request_at = time.time()
+         if self.loaded() and not self._vision_down():
+             return
+@@ -849,6 +884,7 @@
+             s = dict(self.status)
+             hist = list(self.history)
+             totals = dict(self.totals)
++            token_usage = self.token_usage.snapshot(totals)
+         now = time.time()
+         progress = getattr(self.engine, "progress", None)
+         if s.get("busy") and s.get("first_token") is None:
+@@ -874,7 +910,7 @@
+                   **dict(getattr(self.engine, "info", {}) or {})}
+         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
+         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
++                "requests_kept": len(hist), "totals": totals, "token_usage": token_usage, "hardware": tel["now"],
+                 "hardware_static":
+                 tel["static"], "history": tel["history"], "time": now}
+ 
+@@ -1003,6 +1039,8 @@
+         return now
+ 
+     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
++        if not isinstance(cancel, RequestCancel):
++            cancel = RequestCancel(self.shutdown_requested, cancel)
+         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
+         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
+         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
+@@ -1011,12 +1049,11 @@
+             sampling = {**defaults, **req_values}
+         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+         detok, n, finish = Detokenizer(self.tok), 0, "length"
+-        timings, before = None, None                    # this request's timings; the engine's `last` before it
++        timings = None
++        segments, injected = [], 0                      # every GEN pass, not only the final budget continuation
+         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+         emb = getattr(self.embeddings, "path", None)
+-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
+-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
+-        engine_last0 = getattr(self.engine, "last", None)
++        # Capture DONE identity separately for each pass while holding the fifo.
+         with self.status_lock:
+             self.status["queued"] += 1
+         try:
+@@ -1032,10 +1069,13 @@
+                                            max_tokens=max_new)
+                         self.last_request_at = time.time()
+                         self.rate.clear()               # the previous request's samples must not leak into this one
+-                    before = getattr(self.engine, "last", None)
+                     last_print = time.time()
+                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                     while True:
++                        segment_before = getattr(self.engine, "last", None)
++                        segment_received = 0
++                        segment_record = {"prompt_tokens": len(prompt), "received": 0, "done": None}
++                        segments.append(segment_record)
+                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
+                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                         seg, wrap = [], False           # this pass's tokens; the budget is reached
+@@ -1046,6 +1086,7 @@
+                                     yield "ping", None
+                                     continue
+                                 n += 1
++                                segment_received += 1
+                                 if t in self.stop_ids:
+                                     finish = "stop"
+                                     raw_ids.append(t)
+@@ -1075,9 +1116,13 @@
+                             print(f"[strata] the engine reported an error: {e}", flush=True)
+                             raise
+                         finally:
+-                            gen.close()                 # STOP+drain to THIS request's DONE while still holding the
+-                            #                             fifo, so a stop-token break can't leave the shared engine
+-                            #                             queue mid-drain for the next request to read as its own DONE
++                            try:
++                                gen.close()             # STOP+drain while still holding the fifo
++                            finally:
++                                fresh = getattr(self.engine, "last", None)
++                                segment_record.update(received=segment_received,
++                                                      done=dict(fresh) if fresh is not None and fresh is not segment_before
++                                                      else None)
+                         if not wrap or cancel.is_set():
+                             break
+                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
+@@ -1091,6 +1136,7 @@
+                               flush=True)
+                         for t in extra:
+                             n += 1
++                            injected += 1
+                             raw_ids.append(t)
+                             evs = parser.feed(detok.push(t))
+                             self._note(n, evs)
+@@ -1107,10 +1153,9 @@
+                     # it is released the next request sets its own status, which this must not record or clear
+                     with self.status_lock:
+                         if self.status.get("busy"):
+-                            # only this request's DONE counts: same object means no DONE arrived (death, error,
+-                            # disconnect)
+-                            last = dict(getattr(self.engine, "last", {}) or {}) \
+-                                if getattr(self.engine, "last", None) is not engine_last0 else {}
++                            # A continuation's reused prefix is internal work, not cached HTTP input.
++                            # Missing DONE on any pass must not borrow a preceding pass/request's clock.
++                            last = aggregate_segments(len(ids), segments, injected)
+                             started = self.status.get("started", time.time())
+                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
+                             loaded = str(cvec) not in ("0", "", "None")
+@@ -1121,6 +1166,10 @@
+                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                 "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
+                                 "engine_generated": last.get("generated"),
++                                "engine_received": n - injected, "injected_tokens": injected,
++                                "generation_segments": len(segments), "timings_complete": last["timings_complete"],
++                                "continuation_prompt_tokens": last["continuation_prompt_tokens"],
++                                "continuation_reused": last["continuation_reused"],
+                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                                 if n and last.get("generated") and last.get("decode_ms") else None,
+@@ -1133,10 +1182,10 @@
+                             t["output_tokens"] += n
+                             t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                             t["decode_ms"] += last.get("decode_ms") or 0.0
+-                            fresh = getattr(self.engine, "last", None)
+-                            if fresh is not None and fresh is not before:      # the engine's clock for THIS request
++                            self.token_usage.record(len(ids), last.get("reused"), n)
++                            if last["timings_complete"]:
+                                 timings = request_timings(len(ids), n, last)
+-                                self.last_timings = dict(timings, at=int(time.time())) if timings else None
++                            self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                             self.last_request_at = time.time()
+                             now = time.time()
+                             el = now - self.status.get("started", now)
+@@ -1159,21 +1208,60 @@
+                        "timings": timings}
+ 
+ 
++def aggregate_segments(prompt_tokens: int, segments: list[dict], injected: int) -> dict:
++    """Cumulative engine clocks. Only the initial GEN's reused tokens belong to the client's input cache.
++    Unknown final clocks (e.g. engine death) invalidate throughput rather than reusing the previous DONE."""
++    complete = bool(segments) and all(s["done"] is not None and s["done"].get("prompt_ms") is not None
++                                      and s["done"].get("decode_ms") is not None for s in segments)
++    first = (segments[0]["done"] or {}) if segments else {}
++    initial_reused = min(prompt_tokens, max(0, int(first.get("reused") or 0)))
++    clocks = [s["done"] for s in segments if s["done"] is not None]
++    continuation_read, continuation_reused = 0, 0
++    for seg in segments[1:]:
++        reused = min(seg["prompt_tokens"], max(0, int((seg["done"] or {}).get("reused") or 0)))
++        continuation_reused += reused
++        continuation_read += seg["prompt_tokens"] - reused
++    out = {"reused": initial_reused, "generated": sum(int(d.get("generated") or 0) for d in clocks) if complete else None,
++           "prompt_ms": sum(float(d.get("prompt_ms") or 0) for d in clocks),
++           "decode_ms": sum(float(d.get("decode_ms") or 0) for d in clocks),
++           "continuation_prompt_tokens": continuation_read, "continuation_reused": continuation_reused,
++           "generation_segments": len(segments), "injected_tokens": injected, "timings_complete": complete,
++           "generation_segment_details": [
++               {"prompt_tokens": s["prompt_tokens"], "received_tokens": s["received"],
++                "engine_tokens": (s["done"] or {}).get("generated"),
++                "prompt_ms": (s["done"] or {}).get("prompt_ms"),
++                "decode_ms": (s["done"] or {}).get("decode_ms"),
++                "reused": min(s["prompt_tokens"], max(0, int((s["done"] or {}).get("reused") or 0))),
++                "done_received": s["done"] is not None} for s in segments]}
++    for key in ("hits", "lookups", "ram_blobs", "file_blobs", "file_mb", "drafts_offered", "drafts_accepted"):
++        if clocks and all(d.get(key) is not None for d in clocks):
++            out[key] = sum(d[key] for d in clocks)
++    return out
++
++
+ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
+     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
+     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
+     engine keeps no clock (MockEngine)."""
+-    if last.get("prompt_ms") is None:
++    if last.get("prompt_ms") is None or last.get("timings_complete") is False:
+         return None
+-    cache_n = int(last.get("reused") or 0)
+-    prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
+-    decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
++    cache_n = min(prompt_tokens, max(0, int(last.get("reused") or 0)))
++    prompt_n = max(0, prompt_tokens - cache_n) + int(last.get("continuation_prompt_tokens") or 0)
++    prompt_ms, decode_ms = float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
++    decoded = int(last["generated"]) if last.get("generated") is not None else generated
+     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
+             "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else None,
+             "prompt_per_second": round(prompt_n / (prompt_ms / 1000), 1) if prompt_n and prompt_ms > 0 else None,
+             "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
+             "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded else None,
+             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
++            **({"engine_predicted_n": decoded, "injected_tokens": int(last.get("injected_tokens") or 0),
++                "generation_segments": last["generation_segments"], "timings_complete": True,
++                "generation_segment_details": last["generation_segment_details"],
++                "initial_prompt_n": max(0, prompt_tokens - cache_n),
++                "continuation_prompt_n": int(last.get("continuation_prompt_tokens") or 0),
++                "continuation_cache_n": int(last.get("continuation_reused") or 0)}
++               if "generation_segments" in last else {}),
+             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
+             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
+                if last.get("drafts_offered") is not None else {})}
+@@ -1565,7 +1653,7 @@
+             elif path == "/health":
+                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
+                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+-                                 "loaded": svc.loaded()})
++                                 "loaded": svc.loaded(), "shutting_down": svc.shutdown_requested.is_set()})
+             elif path == "/status":
+                 if not self._authorized():                  # #212: it shows the end of the last answer
+                     return
+@@ -1611,6 +1699,18 @@
+             if not self._authorized():
+                 return
+             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
++            if path == "/shutdown":
++                # Return the acknowledgment before the main thread closes HTTP.
++                # Origin/Host checking also prevents cross-site browser requests.
++                if not self._own_page("Closing the service is allowed"):
++                    return
++                self._json(202, {"status": "stopping"})
++                self.wfile.flush()
++                svc.shutdown_requested.set()
++                return
++            if svc.shutdown_requested.is_set():
++                self._json(503, {"error": {"type": "server_error", "message": "Strata is shutting down"}})
++                return
+             if path == "/settings":
+                 self._settings()
+                 return
+@@ -1716,7 +1816,7 @@
+             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+-            cancel = threading.Event()
++            cancel = RequestCancel(svc.shutdown_requested)
+             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                {t["name"] for t in extra}) if use_mcp else None
+             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+@@ -1748,7 +1848,7 @@
+             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
+-            cancel = threading.Event()
++            cancel = RequestCancel(svc.shutdown_requested)
+             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+             if not req.get("stream"):
+                 return self._json(200, anthropic_collect(events))
+@@ -1829,6 +1929,33 @@
+     httpd = Server((host, port), make_handler(svc))
+     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+     return httpd
++
++
++def close_service(httpd, svc):
++    """Close this server and its own children, never other model services."""
++    svc.shutdown_requested.set()
++    acquired = svc.fifo.acquire(timeout=15)
++    try:
++        for child in (svc.engine, svc.vision, svc.mcp):
++            if child is None:
++                continue
++            try:
++                if not acquired and getattr(child, "proc", None) is not None:
++                    # A prompt/encoder that cannot cancel must not stall shutdown.
++                    child.proc.kill()
++                    child.proc.wait(timeout=10)
++                close = getattr(child, "close", None)
++                if close:
++                    close()
++            except Exception as exc:
++                print(f"[strata] cleanup {type(child).__name__}: {type(exc).__name__}", flush=True)
++    finally:
++        if acquired:
++            svc.fifo.release()
++        # The web page stays reachable with shutting_down=true until cleanup is
++        # finished, so it can distinguish accepted from actually offline.
++        httpd.shutdown()
++        httpd.server_close()
+ 
+ 
+ SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+@@ -2015,7 +2142,9 @@
+     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                   sampling_defaults=sampling_defaults,
+-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
++                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
++                  usage_db=os.environ.get('STRATA_TOKEN_USAGE_DB') or cfg.get('token_usage_db') or
++                  (str(Path(a.config).resolve().parent / 'token-usage.sqlite3') if a.config else None))
+     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
+                 for i, x in enumerate(sys.argv)):
+         # #213: an empty key would switch authentication off without a word
+@@ -2036,8 +2165,11 @@
+         if budget:
+             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+                   flush=True)
+-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
+-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
++    # A managed service selects CUDA by UUID. Its physical nvidia-smi index
++    # is supplied separately so Monitor does not accidentally show the RTX 3080.
++    monitor_gpu = os.environ.get("STRATA_MONITOR_GPU_INDEX")
++    svc.gpu_index = int(monitor_gpu) if monitor_gpu is not None else (gpu_list(cfg) or [0])[0]
++    svc.gpu_indices = [svc.gpu_index] if monitor_gpu is not None else gpu_list(cfg)
+     if a.config:                                        # the Chat settings shared with other apps, from last time
+         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
+         try:
+@@ -2089,18 +2221,18 @@
+     except (ValueError, OSError, AttributeError):         # not the main thread
+         pass
+     try:
+-        while True:
+-            time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
++        while not svc.shutdown_requested.wait(1):
++            pass
+     except KeyboardInterrupt:
+-        print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
+-                   hub.close if hub is not None else None]
+-        for close in filter(None, closers):
+-            try:
+-                close()
+-            except KeyboardInterrupt:                   # a second Ctrl+C: don't wait for the engine to free its memory
+-                if getattr(engine, "proc", None):
+-                    engine.proc.kill()
++        svc.shutdown_requested.set()
++    finally:
++        print("\n[strata] stopping the service and releasing its model ...", flush=True)
++        try:
++            close_service(httpd, svc)
++        except KeyboardInterrupt:
++            for child in (engine, vision):
++                if getattr(child, "proc", None):
++                    child.proc.kill()
+         print("[strata] stopped", flush=True)
+     return 0
+ 
+
+diff --git a/serve/web/app.css b/serve/web/app.css
+index 4e8363d..39db0ab 100644
+--- a/serve/web/app.css
++++ b/serve/web/app.css
+@@ -11,6 +11,7 @@
+ .card-title { font-weight: var(--st-fw-bold); font-size: var(--st-fs-base); color: var(--st-ink); }
+ .st-header { position: relative; z-index: 2; flex: none; }
+ .st-header .st-tabs { margin-left: var(--st-s-4); }
++.st-shutdown { flex: none; height: 36px; padding: 0 12px; white-space: nowrap; }
+ #drawer-close .st-icon { transform: rotate(-90deg); }
+ 
+ /* ---------------------------------------------------------------- chat */
+@@ -115,6 +116,10 @@
+ .table-wrap.all { max-height: 420px; overflow-y: auto; }
+ .req-totals { margin: 0; font-size: var(--st-fs-sm); }
+ .req-totals:empty { display: none; }
++.token-usage-card { display: flex; flex-direction: column; gap: var(--st-s-3); min-width: 0; }
++.token-usage-wrap { max-width: 100%; }
++.token-usage-table { min-width: 720px; }
++.token-usage-note { margin: 0; }
+ .mcp-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+ .mcp-server { display: flex; flex-direction: column; gap: var(--st-s-2); padding-top: var(--st-s-3); border-top: 1px solid var(--st-line-soft); }
+ .mcp-server:first-child { padding-top: 0; border-top: 0; }
+@@ -157,14 +162,26 @@
+   .monitor-row { grid-template-columns: 1fr; }
+ }
+ @media (max-width: 640px) {
+-  .st-header { padding: 0 var(--st-s-3); gap: var(--st-s-2); }
++  .st-header { padding: 0 10px; gap: 6px; }
++  .st-header__brand { display: none; }
+   .st-header .st-tabs { margin-left: 0; }
+-  .st-tab { padding: 0 10px; }
++  .st-header .st-tabs { gap: 2px; padding: 2px; }
++  .st-tab { padding: 0 8px; }
+   .st-tab .st-icon { display: none; }
+   #pill-text { display: none; }
++  .st-header .st-pill { height: 28px; padding: 0 8px; }
++  .st-shutdown { height: 32px; padding: 0 9px; font-size: var(--st-fs-sm); }
++  .st-header #theme-btn { width: 32px; height: 32px; }
+   .chat { padding: var(--st-s-5) var(--st-s-4); }
+   .composer-wrap { padding: 0 var(--st-s-3) var(--st-s-3); }
+   .monitor, .about { padding: var(--st-s-4); }
+   .facts { grid-template-columns: 1fr; gap: 2px; }
+   .facts dd { margin-bottom: var(--st-s-2); }
+ }
++@media (max-width: 380px) {
++  .st-header { padding: 0 6px; gap: 5px; }
++  .st-header .st-pill { display: none; }
++  .st-tab { padding: 0 5px; }
++  .st-shutdown { padding: 0 6px; font-size: var(--st-fs-xs); }
++  .st-header #theme-btn { width: 28px; height: 28px; }
++}
+
+diff --git a/serve/web/app.js b/serve/web/app.js
+index 6e8fa6b..b1af747 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -96,14 +96,124 @@
+ $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+ 
+ let health = {model: "strata", images: false, max_context: 0};
++let shutdownState = "idle", pollTimer = null, healthRetry = null;
++function syncShutdownUi() {
++  const locked = shutdownState !== "idle";
++  const btn = $("shutdown-btn");
++  btn.disabled = locked;
++  btn.textContent = shutdownState === "stopped" ? "Offline"
++    : shutdownState === "unconfirmed" ? "Check status" : locked ? "Shutting down…" : "Shutdown";
++  btn.setAttribute("aria-label", btn.textContent);
++  for (const id of ["input", "attach-btn", "file", "new-btn", "export-btn", "sampling-btn", "api-key"])
++    $(id).disabled = locked;
++  for (const control of $("drawer").querySelectorAll("button, input")) control.disabled = locked;
++  $("send-btn").disabled = locked || !!busy;
++  $("stop-btn").disabled = locked;
++  if (shutdownState === "stopping" || shutdownState === "stopped" || shutdownState === "unconfirmed")
++    $("stop-btn").hidden = true;
++}
++function clearServerPolling() {
++  clearTimeout(pollTimer); pollTimer = null;
++  clearTimeout(healthRetry); healthRetry = null;
++  clearTimeout(mcpRetry); mcpRetry = null;
++}
++function finishShutdown() {
++  if (shutdownState === "stopped") return;
++  shutdownState = "stopped";
++  clearServerPolling();
++  syncShutdownUi();
++  setPill("idle", "Offline");
++  $("chat-empty-sub").textContent = "The API is offline. Double-click 启动API服务_Strata.bat to restart it.";
++  $("state-label").textContent = "Offline";
++  $("state-detail").textContent = "Double-click 启动API服务_Strata.bat to restart it.";
++  toast("success", "Offline", "Double-click 启动API服务_Strata.bat to restart it.", 8000);
++}
++function markShutdownUnconfirmed() {
++  if (shutdownState !== "stopping") return;
++  shutdownState = "unconfirmed";
++  clearServerPolling();
++  syncShutdownUi();
++  setPill("queued", "Check status");
++  const text = "Shutdown was accepted, but the API has not confirmed it is offline. Sending stays locked; check the service window, then refresh.";
++  $("chat-empty-sub").textContent = text;
++  $("state-label").textContent = "Check status";
++  $("state-detail").textContent = "The API may still be shutting down; requests remain locked until you refresh.";
++  toast("warn", "Check status", text, 12000);
++}
++async function confirmShutdown() {
++  const deadline = Date.now() + 100000;
++  while (shutdownState === "stopping") {
++    const controller = new AbortController();
++    let timedOut = false;
++    const probeTimer = setTimeout(() => { timedOut = true; controller.abort(); }, 2000);
++    try {
++      const r = await fetch("/health", {headers: headers(), cache: "no-store", signal: controller.signal});
++      if (shutdownState !== "stopping") return;
++      let status = "";
++      try { status = (await r.json()).status || ""; } catch (e) { /* no shutdown confirmation */ }
++      if (status === "shutdown") { finishShutdown(); return; }
++    } catch (e) {
++      if (shutdownState !== "stopping") return;
++      // Fetch rejects with TypeError when the server is unreachable. A probe timeout is only slow,
++      // so keep waiting rather than reporting a false shutdown.
++      if (e instanceof TypeError && !timedOut) { finishShutdown(); return; }
++    } finally {
++      clearTimeout(probeTimer);
++    }
++    if (Date.now() >= deadline) { markShutdownUnconfirmed(); return; }
++    await new Promise((resolve) => setTimeout(resolve, Math.min(500, deadline - Date.now())));
++  }
++}
++async function requestShutdown() {
++  if (shutdownState !== "idle") return;
++  shutdownState = "requesting";
++  syncShutdownUi();
++  setPill("queued", "Shutting down…");
++  const controller = new AbortController();
++  let timedOut = false;
++  const postTimer = setTimeout(() => { timedOut = true; controller.abort(); }, 8000);
++  try {
++    const r = await fetch("/shutdown", {method: "POST", headers: headers(true), body: JSON.stringify({}),
++                                         cache: "no-store", signal: controller.signal});
++    if (r.status === 202) {
++      shutdownState = "stopping";
++      syncShutdownUi();
++      setPill("queued", "Shutting down…");
++      clearServerPolling();
++      if (busy) busy.controller.abort();
++      confirmShutdown();
++      return;
++    }
++    let detail = `HTTP ${r.status}`;
++    try { detail = (await r.json()).error?.message || detail; } catch (e) { /* not JSON */ }
++    shutdownState = "idle";
++    syncShutdownUi();
++    if (r.status === 401) {
++      toast("warn", "API key required", "Enter the API key under About > Settings and try again.", 7000);
++    } else {
++      toast("error", "Shutdown failed", detail, 7000);
++    }
++  } catch (e) {
++    shutdownState = "idle";
++    syncShutdownUi();
++    toast("error", "Shutdown failed", timedOut ? "The shutdown request timed out after 8 seconds. Check the API status and try again."
++      : e.message || String(e), 7000);
++  } finally {
++    clearTimeout(postTimer);
++  }
++}
++$("shutdown-btn").addEventListener("click", requestShutdown);
+ async function loadHealth() {
++  if (shutdownState !== "idle") return;
+   try {
+-    health = await (await fetch("health")).json();
++    const nextHealth = await (await fetch("health")).json();
++    if (shutdownState !== "idle") return;
++    health = nextHealth;
+     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
+                                           : "Attach a text file (or drop it here)";
+     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+   } catch (e) {
+-    setTimeout(loadHealth, 2000);
++    if (shutdownState === "idle") healthRetry = setTimeout(loadHealth, 2000);
+   }
+ }
+ 
+@@ -152,8 +262,10 @@
+ let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+ let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+ async function poll() {
++  if (["stopping", "stopped", "unconfirmed"].includes(shutdownState)) return;
+   try {
+     const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
++    if (["stopping", "stopped", "unconfirmed"].includes(shutdownState)) return;
+     if (r.status === 401) {
+       setPill("error", "API key needed");
+       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+@@ -165,18 +277,27 @@
+       throw new Error(`HTTP ${r.status}`);
+     }
+   } catch (e) {
+-    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+-  }
++    if (!["stopping", "stopped", "unconfirmed"].includes(shutdownState) && ++metricsFailures === 3)
++      setPill("error", "Server not reachable");
++  }
++  if (["stopping", "stopped", "unconfirmed"].includes(shutdownState)) return;
+   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
+-  setTimeout(poll, 1000);
++  pollTimer = setTimeout(poll, 1000);
+ }
+ 
+ function setPill(state, text) {
++  if (shutdownState !== "idle") {
++    state = shutdownState === "stopped" ? "idle" : "queued";
++    text = shutdownState === "stopped" ? "Offline"
++      : shutdownState === "unconfirmed" ? "Check status" : "Shutting down…";
++  }
+   $("pill").dataset.state = state === "error" ? "queued" : state;
+   $("pill-text").textContent = text;
+ }
+ 
+ function render(m) {
++  if (["stopping", "stopped", "unconfirmed"].includes(shutdownState)) return;
++  if ($("drawer").dataset.open === "true") syncEspControl();
+   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
+   const last = (m.requests || [])[0];
+   // the header pill
+@@ -189,7 +310,7 @@
+     setPill("idle", "Idle");
+   }
+   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
++  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.token_usage);
+   if (tab === "about") renderAbout(eng, hw, st);
+ }
+ 
+@@ -202,7 +323,41 @@
+   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
+          `${fmt(t.output_tokens)} written${oSpeed}`;
+ }
+-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
++function usageNumber(value) { return value == null || value === "" || !Number.isFinite(Number(value)) ? "–" : fmt(Number(value)); }
++function usageRow(label, counts) {
++  if (!counts) return `<tr><td>${esc(label)}</td><td class="num">–</td><td class="num">–</td><td class="num">–</td><td class="num">–</td><td class="num">–</td><td class="num">–</td></tr>`;
++  const input = counts.prompt_tokens;
++  const cached = counts.reused;
++  const output = counts.output_tokens;
++  const newInput = input == null || cached == null ? null : Math.max(0, Number(input) - Number(cached));
++  const total = input == null || output == null ? null : Number(input) + Number(output);
++  return `<tr><td>${esc(label)}</td><td class="num">${usageNumber(counts.requests)}</td><td class="num">${usageNumber(input)}</td>` +
++    `<td class="num">${usageNumber(cached)}</td><td class="num">${usageNumber(newInput)}</td><td class="num">${usageNumber(output)}</td><td class="num">${usageNumber(total)}</td></tr>`;
++}
++function usageSince(value, timezone) {
++  if (value == null || !Number.isFinite(Number(value))) return "–";
++  try { return new Date(Number(value) * 1000).toLocaleString("en", {timeZone: timezone, dateStyle: "medium", timeStyle: "short"}); }
++  catch (e) { return "–"; }
++}
++function renderTokenUsage(usage, totals) {
++  const legacy = !usage && totals ? totals : null;
++  const session = usage && usage.session || legacy;
++  const today = usage && usage.today || null;
++  const allTime = usage && usage.all_time || null;
++  $("token-usage-body").innerHTML = usageRow("This run", session) + usageRow("Today", today) + usageRow("All time", allTime);
++  const timezone = usage && usage.timezone || "Asia/Shanghai";
++  const parts = [];
++  if (session && session.since != null) parts.push(`Since ${usageSince(session.since, timezone)}`);
++  if (today && today.date) parts.push(`Beijing day ${today.date}`);
++  else if (legacy) parts.push("Beijing day –");
++  if (usage && usage.persistent === true) parts.push("Persistent");
++  else if (usage && usage.persistent === false) parts.push("Not persistent");
++  if (usage && usage.all_time && usage.all_time.since != null) parts.push(`All time since ${usageSince(usage.all_time.since, timezone)}`);
++  if (usage && usage.persistence_error) parts.push(`Persistence error: ${usage.persistence_error}`);
++  $("token-usage-status").textContent = parts.join(" · ");
++}
++function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, tokenUsage) {
++  renderTokenUsage(tokenUsage, totals);
+   // model state
+   const on = live.queued > 0 ? "queued" : live.state;
+   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+@@ -364,11 +519,14 @@
+ // "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
+ let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
+ async function loadMcp() {
++  if (shutdownState !== "idle") return;
+   try {
+     const r = await fetch("mcp", {headers: headers()});
++    if (shutdownState !== "idle") return;
+     if (!r.ok) return;
+     mcpInfo = await r.json();
+   } catch (e) { return; /* an older server: no MCP */ }
++  if (shutdownState !== "idle") return;
+   renderMcp();
+   clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
+   if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
+@@ -661,13 +819,14 @@
+ 
+ function setBusy(on) {
+   $("stop-btn").hidden = !on;
+-  $("send-btn").disabled = on;
++  $("send-btn").disabled = on || shutdownState !== "idle";
+   $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
++  if (["stopping", "stopped", "unconfirmed"].includes(shutdownState)) $("stop-btn").hidden = true;
+ }
+ 
+ async function send() {
+   const text = $("input").value.trim();
+-  if ((!text && !attachments.length) || busy) return;
++  if (shutdownState !== "idle" || (!text && !attachments.length) || busy) return;
+   messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
+                  files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
+   attachments = [];
+@@ -741,7 +900,7 @@
+       }
+     }
+   } catch (e) {
+-    if (e.name === "AbortError") m.stopped = true;
++    if (e.name === "AbortError" || ["stopping", "stopped", "unconfirmed"].includes(shutdownState)) m.stopped = true;
+     else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+   }
+   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+@@ -804,6 +963,7 @@
+          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
+ }
+ function addFiles(files) {
++  if (shutdownState !== "idle") return;
+   for (const f of files) {
+     if (f.type.startsWith("image/")) {
+       if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
+@@ -890,7 +1050,7 @@
+   $("s-max").value = s.max; $("s-seed").value = s.seed;
+   $("s-show").setAttribute("aria-checked", String(!!s.show));
+   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
+-  $("esp-row").hidden = !projectionLoaded();
++  syncEspControl();
+   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
+   $("s-share").setAttribute("aria-checked", String(sharedOn));
+   outputs();
+@@ -926,6 +1086,14 @@
+ function projectionLoaded() {
+   const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
+   return !!c && c !== "0";
++}
++function syncEspControl() {
++  const loaded = projectionLoaded();
++  $("s-esp").disabled = !loaded;
++  $("s-esp").title = loaded ? "Per-request; does not reload the model" : "Disabled: start an ESP Profile to load ESP";
++  $("esp-row-sub").textContent = loaded
++    ? "Per-request experimental speed projection; switching does not reload the model."
++    : "Disabled until you start an ESP Profile. Per-request; switching does not reload the model.";
+ }
+ function outputs() {
+   const t = +$("s-temp").value;
+
+diff --git a/serve/web/index.html b/serve/web/index.html
+index d858d2f..c5880d5 100644
+--- a/serve/web/index.html
++++ b/serve/web/index.html
+@@ -32,6 +32,7 @@
+     <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
+   <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
+     <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
++  <button type="button" class="st-btn st-btn--danger st-shutdown" id="shutdown-btn" title="Shuts down API and unloads model" aria-label="Shutdown">Shutdown</button>
+ </header>
+ 
+ <main>
+@@ -131,6 +132,17 @@
+         <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
+           (in this page's chat only; switch it off in Sampling).</p>
+       </div>
++
++      <div class="st-card token-usage-card">
++        <div class="req-head"><span class="card-title">Token usage</span><span class="muted small" id="token-usage-status"></span></div>
++        <div class="table-wrap token-usage-wrap">
++          <table class="st-table token-usage-table">
++            <thead><tr><th>Period</th><th class="num">Requests</th><th class="num">Input</th><th class="num">Cached</th><th class="num">New input</th><th class="num">Output</th><th class="num">Total</th></tr></thead>
++            <tbody id="token-usage-body"><tr><td colspan="7" class="muted">No usage data</td></tr></tbody>
++          </table>
++        </div>
++        <p class="muted small token-usage-note">Output includes thinking and answer. Total = Input + Output; cached tokens are shown separately and are not added again.</p>
++      </div>
+     </div>
+   </section>
+ 
+@@ -204,11 +216,9 @@
+     <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
+       id="mcp-row-sub">the model may call them while it answers</span></span>
+       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>
+-    <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
+-      engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
+-      <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>
+-    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small">omp and other API clients get
+-      these settings for anything they don't set themselves</span></span>
++    <div class="toggle-row" id="esp-row"><span>ESP<br><span class="muted small" id="esp-row-sub">Per-request experimental speed projection; switching does not reload the model.</span></span>
++      <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="ESP" title="Per-request; does not reload the model"></button></div>
++    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small">After Apply, other apps use these shared defaults for parameters they omit.</span></span>
+       <button class="st-toggle" id="s-share" role="switch" aria-checked="false" aria-label="Use for other apps too"></button></div>
+     <div class="drawer-actions">
+       <button class="st-btn st-btn--secondary" id="s-reset" type="button">Reset</button>
+
+diff --git a/serve/token_usage.py b/serve/token_usage.py
+new file mode 100644
+index 0000000..af60d49
+--- /dev/null
++++ b/serve/token_usage.py
+@@ -0,0 +1,91 @@
++"""Local token counters, shared by managed Profiles; no prompts or credentials stored."""
++from contextlib import closing
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++import sqlite3
++import threading
++import time
++
++FIELDS = ('requests', 'prompt_tokens', 'reused', 'output_tokens')
++BEIJING = timezone(timedelta(hours=8))
++
++
++def day_of(timestamp):
++    return datetime.fromtimestamp(timestamp, BEIJING).date().isoformat()
++
++
++def zero():
++    return dict.fromkeys(FIELDS, 0)
++
++
++class TokenUsage:
++    """One managed server writer; atomic SQLite commits and inexpensive memory snapshots.
++
++    Requests are attributed to their completion date in Beijing time. Polling does
++    not write or increment counters. After a write failure, the next successful
++    write stores the full pending aggregates without counting a request twice.
++    """
++    def __init__(self, path=None, *, now=None):
++        self.path = Path(path) if path else None
++        self.lock = threading.Lock()
++        self.since = time.time() if now is None else now
++        self.total = zero()
++        self.days = {}
++        self.pending = set()
++        self.error = None
++        self.blocked = False
++        if self.path:
++            try:
++                self.path.parent.mkdir(parents=True, exist_ok=True)
++                with closing(sqlite3.connect(self.path, timeout=2)) as db:
++                    with db:
++                        db.execute('CREATE TABLE IF NOT EXISTS total (id INTEGER PRIMARY KEY CHECK(id=1), since REAL NOT NULL, requests INTEGER NOT NULL, prompt_tokens INTEGER NOT NULL, reused INTEGER NOT NULL, output_tokens INTEGER NOT NULL)')
++                        db.execute('CREATE TABLE IF NOT EXISTS days (date TEXT PRIMARY KEY, requests INTEGER NOT NULL, prompt_tokens INTEGER NOT NULL, reused INTEGER NOT NULL, output_tokens INTEGER NOT NULL)')
++                        row = db.execute('SELECT since,requests,prompt_tokens,reused,output_tokens FROM total WHERE id=1').fetchone()
++                        if row:
++                            self.since = row[0]
++                            self.total = dict(zip(FIELDS, row[1:]))
++                        else:
++                            db.execute('INSERT INTO total VALUES (1,?,0,0,0,0)', (self.since,))
++                        self.days = {r[0]: dict(zip(FIELDS, r[1:])) for r in db.execute('SELECT date,requests,prompt_tokens,reused,output_tokens FROM days')}
++                for counts in [self.total, *self.days.values()]:
++                    if any(type(v) is not int or v < 0 for v in counts.values()) or counts['reused'] > counts['prompt_tokens']:
++                        raise ValueError('Invalid stored token counters')
++            except (OSError, sqlite3.Error, ValueError) as exc:
++                self.total, self.days = zero(), {}
++                self.blocked = True  # preserve unreadable database; do not replace it
++                self.error = str(exc)
++
++    def record(self, prompt_tokens, reused, output_tokens, *, at=None):
++        counts = {'requests': 1, 'prompt_tokens': max(0, int(prompt_tokens)),
++                  'reused': max(0, int(reused or 0)), 'output_tokens': max(0, int(output_tokens))}
++        counts['reused'] = min(counts['reused'], counts['prompt_tokens'])
++        date = day_of(time.time() if at is None else at)
++        with self.lock:
++            today = self.days.setdefault(date, zero())
++            for key, value in counts.items():
++                self.total[key] += value
++                today[key] += value
++            self.pending.add(date)
++            if not self.path or self.blocked:
++                return
++            try:
++                with closing(sqlite3.connect(self.path, timeout=2)) as db:
++                    with db:
++                        db.execute('UPDATE total SET since=?,requests=?,prompt_tokens=?,reused=?,output_tokens=? WHERE id=1',
++                                   (self.since, *(self.total[k] for k in FIELDS)))
++                        db.executemany('INSERT OR REPLACE INTO days VALUES (?,?,?,?,?)',
++                                       [(date, *(self.days[date][k] for k in FIELDS)) for date in sorted(self.pending)])
++                self.pending.clear()
++                self.error = None
++            except (OSError, sqlite3.Error) as exc:
++                self.error = str(exc)  # generation still succeeds; Monitor shows failure
++
++    def snapshot(self, session, *, now=None):
++        date = day_of(time.time() if now is None else now)
++        with self.lock:
++            return {'session': dict(session),
++                    'today': None if self.blocked else {'date': date, **self.days.get(date, zero())},
++                    'all_time': None if self.blocked else {'since': self.since, **self.total}, 'timezone': 'Asia/Shanghai',
++                    'persistent': bool(self.path) and not self.error,
++                    'persistence_error': self.error}
+
+diff --git a/serve/test_generation_accounting.py b/serve/test_generation_accounting.py
+new file mode 100644
+index 0000000..af17614
+--- /dev/null
++++ b/serve/test_generation_accounting.py
+@@ -0,0 +1,143 @@
++"""Request accounting across budget continuations, drained stops and failed clocks (no GPU)."""
++import json
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++
++from serve.frontend import ChatTemplate
++from serve.server import (ByteTokenizer, EngineDied, REASONING_WRAP_UP, Service,
++                          aggregate_segments, request_timings)
++from serve.test_server import ThinkingEngine
++
++
++class SegmentedEngine(ThinkingEngine):
++    def __init__(self, tok, failure=None):
++        super().__init__(tok)
++        self.last = {"generated": 999, "reused": 999, "prompt_ms": 999, "decode_ms": 999}
++        self.failure = failure
++
++    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++        continuation = bool(self.prompts)
++        count = 0
++        failed = False
++        try:
++            for token in super().generate(ids, max_new, sampling, cancel, embeddings):
++                count += 1
++                yield token
++                if continuation and self.failure == "death" and count == 2:
++                    failed = True
++                    raise EngineDied("synthetic missing DONE")
++        finally:
++            if not failed:
++                # Deliberately different rates: final pass alone must not be the request's rate.
++                self.last = {"generated": count, "prompt_tokens": len(ids),
++                             "reused": len(ids) - 3 if continuation else 5,
++                             "prompt_ms": 30.0 if continuation else 100.0,
++                             "decode_ms": count * (10.0 if continuation else 20.0),
++                             "drafts_offered": count * 2, "drafts_accepted": count,
++                             "hits": count * 9, "lookups": count * 10}
++
++
++class GenerationAccounting(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.tok = ByteTokenizer()
++        self.engine = SegmentedEngine(self.tok)
++        self.svc = Service(self.engine, self.tok,
++                           ChatTemplate(Path(__file__).with_name("chat_template.jinja")),
++                           usage_db=Path(self.tmp.name) / "usage.sqlite3")
++        self.ids = self.tok.encode("p" * 80)
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def run_request(self, budget=20, cancel=None):
++        events = list(self.svc.run(self.ids, True, None, 400,
++                                  {"reasoning_budget_tokens": budget}, cancel or threading.Event()))
++        return next(value for kind, value in events if kind == "done")
++
++    def test_budget_totals_two_clocks_but_only_initial_input_cache(self):
++        done = self.run_request()
++        wrap = len(self.tok.encode(REASONING_WRAP_UP, parse_special=True))
++        actual = 20 + len(self.engine.ANSWER) + 1
++        t = done["timings"]
++        self.assertEqual(done["completion_tokens"], actual + wrap)
++        self.assertEqual(done["reused"], 5)
++        self.assertEqual(t["generation_segments"], 2)
++        self.assertEqual(t["engine_predicted_n"], actual)
++        self.assertEqual(t["injected_tokens"], wrap)
++        self.assertEqual(t["predicted_ms"], 20 * 20 + (actual - 20) * 10)
++        self.assertEqual(t["prompt_ms"], 130)
++        self.assertEqual(sum(s["engine_tokens"] for s in t["generation_segment_details"]), actual)
++        self.assertEqual(sum(s["decode_ms"] for s in t["generation_segment_details"]), t["predicted_ms"])
++        self.assertEqual((t["initial_prompt_n"], t["continuation_prompt_n"]), (75, 3))
++        self.assertEqual(t["prompt_n"], 78)
++        self.assertAlmostEqual(t["predicted_per_second"], actual / (t["predicted_ms"] / 1000), delta=.1)
++        self.assertEqual((t["draft_n"], t["draft_n_accepted"]), (actual * 2, actual))
++        row = self.svc.metrics()["requests"][-1]
++        self.assertEqual(row["engine_generated"], actual)
++        self.assertEqual(row["reused"], 5)
++        self.assertTrue(row["timings_complete"])
++        for key in ("session", "today", "all_time"):
++            usage = self.svc.metrics()["token_usage"][key]
++            self.assertEqual((usage["prompt_tokens"], usage["reused"], usage["output_tokens"]),
++                             (80, 5, actual + wrap))
++
++    def test_natural_thought_single_pass_has_no_injection(self):
++        t = self.run_request(budget=10000)["timings"]
++        self.assertEqual((t["generation_segments"], t["injected_tokens"]), (1, 0))
++        self.assertEqual((t["cache_n"], t["prompt_n"]), (5, 75))
++        self.assertEqual(t["predicted_n"], t["engine_predicted_n"])
++
++    def test_death_after_first_pass_does_not_reuse_its_done_as_final_clock(self):
++        self.engine.failure = "death"
++        with self.assertRaises(EngineDied):
++            self.run_request()
++        row = self.svc.metrics()["requests"][-1]
++        self.assertEqual(row["generation_segments"], 2)
++        self.assertFalse(row["timings_complete"])
++        self.assertEqual(row["finish"], "error")
++        self.assertIsNone(row["engine_generated"])
++        self.assertIsNone(row["decode_tok_s"])
++        self.assertIsNone(self.svc.last_timings)
++        self.assertEqual(row["reused"], 5)
++
++    def test_disconnect_drains_and_accounts_partial_current_pass(self):
++        gen = self.svc.run(self.ids, True, None, 400, {"reasoning_budget_tokens": 20}, threading.Event())
++        for kind, value in gen:
++            if kind == "event":
++                break
++        gen.close()
++        row = self.svc.metrics()["requests"][-1]
++        self.assertEqual(row["finish"], "disconnect")
++        self.assertEqual(row["generation_segments"], 1)
++        self.assertTrue(row["timings_complete"])
++        self.assertLess(row["output_tokens"], 400)
++        self.assertEqual(row["injected_tokens"], 0)
++
++    def test_cancel_does_not_start_budget_continuation(self):
++        cancel = threading.Event()
++        gen = self.svc.run(self.ids, True, None, 400, {"reasoning_budget_tokens": 20}, cancel)
++        for kind, value in gen:
++            if kind == "event":
++                cancel.set()
++                break
++        remaining = list(gen)
++        done = next(value for kind, value in remaining if kind == "done")
++        self.assertEqual(done["finish"], "cancel")
++        self.assertEqual(done["timings"]["generation_segments"], 1)
++        self.assertEqual(len(self.engine.prompts), 1)
++
++    def test_aggregate_clamps_cache_and_keeps_zero_decode_count(self):
++        result = aggregate_segments(10, [{"prompt_tokens": 10, "received": 0,
++                                         "done": {"prompt_ms": 2, "decode_ms": 3,
++                                                  "generated": 0, "reused": 999}}], 0)
++        timing = request_timings(10, 7, result)
++        self.assertEqual(timing["cache_n"], 10)
++        self.assertIsNone(timing["predicted_per_second"])
++        self.assertEqual(timing["engine_predicted_n"], 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+diff --git a/serve/test_shutdown.py b/serve/test_shutdown.py
+new file mode 100644
+index 0000000..0ac7482
+--- /dev/null
++++ b/serve/test_shutdown.py
+@@ -0,0 +1,282 @@
++"""Offline shutdown lifecycle tests; no production port, real model, or GPU is used."""
++from __future__ import annotations
++
++import json
++import os
++import socket
++import subprocess
++import sys
++import threading
++import time
++import unittest
++import urllib.error
++import urllib.request
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++from serve.frontend import ChatTemplate
++from serve import server as srv
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class RestartTrackingEngine(srv.MockEngine):
++    def __init__(self, tokenizer):
++        super().__init__(tokenizer, "hello", max_context=4096)
++        self.restart_count = 0
++        self.is_alive = True
++
++    def alive(self):
++        return self.is_alive
++
++    def restart(self):
++        self.restart_count += 1
++        self.is_alive = True
++
++
++class EndpointShutdownTests(unittest.TestCase):
++    def setUp(self):
++        self.tok = srv.ByteTokenizer()
++        self.engine = RestartTrackingEngine(self.tok)
++        self.svc = srv.Service(self.engine, self.tok,
++                               ChatTemplate(ROOT / "serve" / "chat_template.jinja"),
++                               model_name="shutdown-test")
++        self.svc.api_key = "shutdown-test-key"
++        self.httpd = srv.Server(("127.0.0.1", 0), srv.make_handler(self.svc))
++        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
++        self.thread.start()
++        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
++        self.origin = self.base
++
++    def tearDown(self):
++        if self.thread.is_alive():
++            self.httpd.shutdown()
++        self.httpd.server_close()
++        self.thread.join(timeout=3)
++
++    def post(self, path, *, headers=None, body=None):
++        payload = json.dumps({} if body is None else body).encode("utf-8")
++        req = urllib.request.Request(self.base + path, data=payload,
++                                     headers=headers or {}, method="POST")
++        try:
++            with urllib.request.urlopen(req, timeout=3) as response:
++                raw = response.read()
++                return response.status, json.loads(raw) if raw else {}
++        except urllib.error.HTTPError as exc:
++            with exc:
++                raw = exc.read()
++                return exc.code, json.loads(raw) if raw else {}
++
++    def headers(self, *, key="shutdown-test-key", origin=None, content_type="application/json"):
++        value = {"Content-Type": content_type}
++        if key is not None:
++            value["Authorization"] = "Bearer " + key
++        if origin is not None:
++            value["Origin"] = origin
++        return value
++
++    def test_missing_and_wrong_auth_return_401_without_shutdown(self):
++        for key in (None, "wrong-key"):
++            with self.subTest(key_present=key is not None):
++                status, _ = self.post("/shutdown", headers=self.headers(key=key, origin=self.origin))
++                self.assertEqual(status, 401)
++                self.assertFalse(self.svc.shutdown_requested.is_set())
++
++    def test_foreign_origin_and_non_json_are_refused(self):
++        status, _ = self.post("/shutdown", headers=self.headers(origin="http://attacker.example"))
++        self.assertEqual(status, 403)
++        self.assertFalse(self.svc.shutdown_requested.is_set())
++
++        status, _ = self.post("/shutdown", headers=self.headers(origin=self.origin,
++                                                                content_type="text/plain"))
++        self.assertEqual(status, 415)
++        self.assertFalse(self.svc.shutdown_requested.is_set())
++
++    def test_authorized_same_origin_shutdown_is_accepted_and_idempotent(self):
++        headers = self.headers(origin=self.origin)
++        status, body = self.post("/shutdown", headers=headers)
++        self.assertEqual((status, body), (202, {"status": "stopping"}))
++        self.assertTrue(self.svc.shutdown_requested.is_set())
++
++        status, body = self.post("/shutdown", headers=headers)
++        self.assertEqual((status, body), (202, {"status": "stopping"}))
++        self.assertTrue(self.svc.shutdown_requested.is_set())
++
++    def test_shutdown_rejects_load_and_chat_without_restarting_engine(self):
++        self.engine.is_alive = False
++        self.svc.shutdown_requested.set()
++        status, _ = self.post("/load", headers=self.headers(origin=self.origin))
++        self.assertEqual(status, 503)
++        status, _ = self.post("/v1/chat/completions", headers=self.headers(origin=self.origin), body={
++            "model": "shutdown-test", "messages": [{"role": "user", "content": "hello"}],
++            "max_tokens": 8,
++        })
++        self.assertEqual(status, 503)
++        self.assertEqual(self.engine.restart_count, 0)
++        self.assertFalse(self.engine.is_alive)
++
++    def test_generation_observes_request_cancellation(self):
++        entered = threading.Event()
++        self.engine.last_prompt = []
++
++        def generate(ids, max_new, sampling, cancel, embeddings=None):
++            yield self.tok.encode("x")[0]
++            entered.set()
++            cancel.wait(5)
++            self.assert_cancelled = cancel.is_set()
++
++        self.engine.generate = generate
++        client_cancel = threading.Event()
++        events = []
++        errors = []
++
++        def consume():
++            try:
++                events.extend(self.svc.run([], False, None, 32, {}, client_cancel))
++            except BaseException as exc:  # preserve worker failure for the test thread
++                errors.append(exc)
++
++        worker = threading.Thread(target=consume)
++        worker.start()
++        self.assertTrue(entered.wait(2), "mock generation did not start")
++        client_cancel.set()
++        worker.join(timeout=3)
++        self.assertFalse(worker.is_alive(), "generation ignored cancellation")
++        self.assertEqual(errors, [])
++        done = [payload for kind, payload in events if kind == "done"]
++        self.assertEqual(len(done), 1)
++        self.assertEqual(done[0]["finish"], "cancel")
++
++    def test_queued_generation_after_shutdown_cannot_restart_engine(self):
++        self.engine.is_alive = False
++        self.engine.unloaded = True
++        self.svc.fifo.acquire()
++        errors = []
++
++        def consume():
++            try:
++                list(self.svc.run([], False, None, 32, {}, None))
++            except BaseException as exc:
++                errors.append(exc)
++
++        worker = threading.Thread(target=consume)
++        worker.start()
++        try:
++            deadline = time.monotonic() + 2
++            while self.svc.status["queued"] != 1 and time.monotonic() < deadline:
++                time.sleep(0.005)
++            self.assertEqual(self.svc.status["queued"], 1, "request did not queue behind the active slot")
++            self.svc.shutdown_requested.set()
++        finally:
++            self.svc.fifo.release()
++        worker.join(timeout=3)
++        self.assertFalse(worker.is_alive())
++        self.assertEqual(len(errors), 1)
++        self.assertIsInstance(errors[0], srv.ServiceStopping)
++        self.assertEqual(self.engine.restart_count, 0)
++        self.assertEqual(self.svc.status["queued"], 0)
++
++
++class CancellationAndCleanupTests(unittest.TestCase):
++    def test_request_cancel_wait_and_both_cancel_sources(self):
++        shutdown = threading.Event()
++        client = threading.Event()
++        cancel = srv.RequestCancel(shutdown, client)
++        self.assertFalse(cancel.is_set())
++        self.assertFalse(cancel.wait(0.02))
++        client.set()
++        self.assertTrue(cancel.wait(0.2))
++
++        shutdown2 = threading.Event()
++        cancel2 = srv.RequestCancel(shutdown2)
++        shutdown2.set()
++        self.assertTrue(cancel2.is_set())
++        self.assertTrue(cancel2.wait(0.2))
++
++    def test_close_service_closes_only_owned_engine_vision_and_http(self):
++        class Child:
++            def __init__(self):
++                self.close = mock.Mock()
++                self.proc = SimpleNamespace(kill=mock.Mock(), wait=mock.Mock())
++
++        engine, vision, mcp, unrelated = Child(), Child(), Child(), Child()
++        svc = SimpleNamespace(shutdown_requested=threading.Event(), fifo=threading.Lock(),
++                              engine=engine, vision=vision, mcp=mcp)
++        httpd = SimpleNamespace(shutdown=mock.Mock(), server_close=mock.Mock())
++        srv.close_service(httpd, svc)
++
++        self.assertTrue(svc.shutdown_requested.is_set())
++        for child in (engine, vision, mcp):
++            child.close.assert_called_once_with()
++            child.proc.kill.assert_not_called()
++            child.proc.wait.assert_not_called()
++        unrelated.close.assert_not_called()
++        unrelated.proc.kill.assert_not_called()
++        httpd.shutdown.assert_called_once_with()
++        httpd.server_close.assert_called_once_with()
++
++
++@unittest.skipUnless(os.name == "nt", "uses Windows CREATE_NO_WINDOW for an isolated mock server")
++class MainProcessShutdownTests(unittest.TestCase):
++    def test_main_post_shutdown_exits_and_closes_random_port(self):
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
++            reservation.bind(("127.0.0.1", 0))
++            port = reservation.getsockname()[1]
++
++        # Run the real server main loop and HTTP stack with MockEngine. Disable
++        # telemetry in this child so this test never touches NVML or a GPU.
++        child_script = (
++            "import serve.server as s; "
++            "s.Service.start_telemetry = lambda self: None; "
++            "raise SystemExit(s.main())"
++        )
++        command = [sys.executable, "-c", child_script, "--engine", "mock", "--host", "127.0.0.1",
++                   "--port", str(port), "--api-key", "shutdown-child-key"]
++        proc = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                                creationflags=subprocess.CREATE_NO_WINDOW)
++        base = f"http://127.0.0.1:{port}"
++        try:
++            deadline = time.monotonic() + 15
++            ready = False
++            last_error = None
++            while time.monotonic() < deadline and proc.poll() is None:
++                try:
++                    with urllib.request.urlopen(base + "/health", timeout=0.5) as response:
++                        health = json.loads(response.read())
++                    ready = health.get("status") == "ok"
++                    if ready:
++                        break
++                except (OSError, ValueError) as exc:
++                    last_error = exc
++                    time.sleep(0.05)
++            if not ready:
++                output = proc.stdout.read().decode("utf-8", "replace") if proc.poll() is not None else ""
++                self.fail(f"mock main did not become ready: {last_error}; exit={proc.poll()}; {output[-1000:]}")
++
++            req = urllib.request.Request(base + "/shutdown", data=b"{}", method="POST", headers={
++                "Authorization": "Bearer shutdown-child-key",
++                "Content-Type": "application/json",
++                "Origin": base,
++            })
++            with urllib.request.urlopen(req, timeout=3) as response:
++                self.assertEqual(response.status, 202)
++                self.assertEqual(json.loads(response.read()), {"status": "stopping"})
++            self.assertEqual(proc.wait(timeout=10), 0)
++            with self.assertRaises(OSError):
++                socket.create_connection(("127.0.0.1", port), timeout=0.5)
++        finally:
++            if proc.poll() is None:
++                proc.terminate()
++                try:
++                    proc.wait(timeout=3)
++                except subprocess.TimeoutExpired:
++                    proc.kill()
++                    proc.wait(timeout=3)
++            if proc.stdout:
++                proc.stdout.close()
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+diff --git a/serve/test_token_usage.py b/serve/test_token_usage.py
+new file mode 100644
+index 0000000..de11e73
+--- /dev/null
++++ b/serve/test_token_usage.py
+@@ -0,0 +1,108 @@
++"""Persistence, day boundaries and service accounting, without production models."""
++from datetime import datetime, timezone
++from pathlib import Path
++import sqlite3
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++
++from serve.token_usage import TokenUsage
++from serve.server import ByteTokenizer, MockEngine, Service
++from serve.frontend import ChatTemplate
++
++
++def stamp(value):
++    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp()
++
++
++class TokenUsageTests(unittest.TestCase):
++    def test_restart_and_metrics_do_not_double_count(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'tokens.sqlite3'
++            ledger = TokenUsage(path, now=stamp('2026-10-04T13:00:00'))
++            ledger.record(100, 40, 25, at=stamp('2026-10-04T13:01:00'))
++            for _ in range(3):
++                self.assertEqual(ledger.snapshot({}, now=stamp('2026-10-04T13:02:00'))['all_time']['requests'], 1)
++            restored = TokenUsage(path)
++            row = restored.snapshot({'requests': 0}, now=stamp('2026-10-04T13:05:00'))
++            self.assertTrue(row['persistent'])
++            self.assertEqual(row['session']['requests'], 0)
++            self.assertEqual(row['today']['prompt_tokens'], 100)
++            self.assertEqual(row['all_time']['reused'], 40)
++            restored.record(30, 0, 10, at=stamp('2026-10-04T13:06:00'))
++            final = TokenUsage(path).snapshot({}, now=stamp('2026-10-04T13:07:00'))
++            self.assertEqual(final['all_time']['requests'], 2)
++            self.assertEqual(final['all_time']['output_tokens'], 35)
++
++    def test_beijing_midnight_and_empty_day(self):
++        ledger = TokenUsage(now=stamp('2026-10-04T15:00:00'))
++        ledger.record(10, 0, 5, at=stamp('2026-10-04T15:59:59'))
++        ledger.record(20, 10, 8, at=stamp('2026-10-04T16:00:00'))
++        now = ledger.snapshot({}, now=stamp('2026-10-04T16:01:00'))
++        self.assertEqual(now['today']['date'], '2026-10-05')
++        self.assertEqual(now['today']['requests'], 1)
++        self.assertEqual(now['today']['prompt_tokens'], 20)
++        self.assertEqual(now['all_time']['requests'], 2)
++        self.assertEqual(ledger.snapshot({}, now=stamp('2026-10-05T16:00:00'))['today']['requests'], 0)
++
++    def test_invalid_database_is_preserved_and_reported(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'tokens.sqlite3'
++            path.write_bytes(b'existing invalid file')
++            ledger = TokenUsage(path)
++            ledger.record(10, None, 2)
++            row = ledger.snapshot({})
++            self.assertFalse(row['persistent'])
++            self.assertTrue(row['persistence_error'])
++            self.assertEqual(path.read_bytes(), b'existing invalid file')
++            self.assertIsNone(row['all_time'])
++            self.assertIsNone(row['today'])  # unreadable history is not a fabricated zero
++
++    def test_failed_write_recovery_across_midnight(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'tokens.sqlite3'
++            ledger = TokenUsage(path)
++            with patch('serve.token_usage.sqlite3.connect', side_effect=sqlite3.OperationalError('disk unavailable')):
++                ledger.record(100, 30, 20, at=stamp('2026-10-04T15:59:59'))
++            self.assertTrue(ledger.snapshot({})['persistence_error'])
++            ledger.record(50, 5, 10, at=stamp('2026-10-04T16:00:01'))
++            restored = TokenUsage(path)
++            today = restored.snapshot({}, now=stamp('2026-10-04T16:00:01'))
++            yesterday = restored.snapshot({}, now=stamp('2026-10-04T15:59:59'))
++            self.assertTrue(today['persistent'])
++            self.assertEqual(today['today']['requests'], 1)
++            self.assertEqual(yesterday['today']['requests'], 1)
++            self.assertEqual(today['all_time']['requests'], 2)
++            self.assertEqual(today['all_time']['output_tokens'], 30)
++
++    def test_parallel_recording_is_serialized(self):
++        with tempfile.TemporaryDirectory() as td:
++            ledger = TokenUsage(Path(td) / 'tokens.sqlite3')
++            threads = [threading.Thread(target=ledger.record, args=(10, 4, 3)) for _ in range(12)]
++            for thread in threads:
++                thread.start()
++            for thread in threads:
++                thread.join()
++            self.assertEqual(TokenUsage(ledger.path).snapshot({})['all_time']['requests'], 12)
++            self.assertEqual(ledger.snapshot({})['all_time']['reused'], 48)
++
++    def test_service_accounting_matches_session_and_survives_new_instance(self):
++        with tempfile.TemporaryDirectory() as td:
++            tok = ByteTokenizer()
++            path = Path(td) / 'tokens.sqlite3'
++            svc = Service(MockEngine(tok, 'hello', max_context=4096), tok,
++                          ChatTemplate(Path(__file__).parent / 'chat_template.jinja'), usage_db=path)
++            list(svc.run(tok.encode('hi'), False, [], 20, {}, threading.Event()))
++            before = svc.metrics()
++            self.assertEqual(before['token_usage']['all_time']['requests'], 1)
++            for field in ('requests', 'prompt_tokens', 'reused', 'output_tokens'):
++                self.assertEqual(before['token_usage']['all_time'][field], before['totals'][field])
++            svc2 = Service(MockEngine(tok, 'hello', max_context=4096), tok,
++                           ChatTemplate(Path(__file__).parent / 'chat_template.jinja'), usage_db=path)
++            self.assertEqual(svc2.metrics()['totals']['requests'], 0)
++            self.assertEqual(svc2.metrics()['token_usage']['all_time']['requests'], 1)
++
++
++if __name__ == '__main__':
++    unittest.main()

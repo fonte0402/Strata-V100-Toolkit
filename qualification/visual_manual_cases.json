@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "review_mode": "user_manual_pending",
+  "cases": [
+    {
+      "id": "visual-01",
+      "artifact_type": "svg",
+      "prompt": "generate an svg of a pelican riding a bicycle  "
+    },
+    {
+      "id": "visual-02",
+      "artifact_type": "html",
+      "prompt": "重新创建一个HTML，内容是SVG绘制一个鹈鹕骑自行车的2D动画，你不需要任何测试创建一个HTML，内容是SVG绘制一个鹈鹕骑自行车的2D动画，你不需要任何测试。"
+    }
+  ]
+}

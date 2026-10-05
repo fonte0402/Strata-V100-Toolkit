@@ -1,0 +1,43 @@
+{
+  "source_archive": "strata-v38.tar.gz",
+  "source_archive_sha256": "48053a353a7a3a002f77e4b09eb967d9b5e56c30fce8bb29bc7dc1a757f6ed85",
+  "source_root": "Strata-0.1.38",
+  "source_version": "v0.1.38",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "kind": "modified",
+      "base_sha256": "7c85aa14ef1d8b7f72401036a8685860d8878403ecfa02624e9c186d73db3158",
+      "result_sha256": "a668aa77a0eaaae8486a8ec021b9b4869a7ab841fe223af959f38832c4b37b0d"
+    },
+    {
+      "path": "include/strata/core/expert_cache.hpp",
+      "kind": "modified",
+      "base_sha256": "a51821644c37bfc8fa7f67d0ca1e376f46fc21f6877135d136aeadd9981afa35",
+      "result_sha256": "773e3a329785fe98136c2f1716fbc15365eb6fe696b7ff4451b8b3f4d938dc29"
+    },
+    {
+      "path": "src/core/expert_cache.cpp",
+      "kind": "modified",
+      "base_sha256": "438efa2e79e188f973520738fdea622cd0f09191682cc5b54817fef14c74c138",
+      "result_sha256": "984d2539f6f8e425938e75c814abcfc83afc607a94db5a35c226875be682d55e"
+    },
+    {
+      "path": "src/program/generate.cpp",
+      "kind": "modified",
+      "base_sha256": "27e841224c32256bf38570b6792e67704e1d9333bb055701c25b102c32d43c7f",
+      "result_sha256": "d4d646db254026d38ac35368212e113d046df1dda2192a927ec8b00f30c3aec1"
+    },
+    {
+      "path": "src/core/expert_cache_sized_test.cpp",
+      "kind": "added",
+      "result_sha256": "bdd5d20b24b30ad31549bee64f61c58e547f0a608de095e87fabef97bdfec946"
+    }
+  ],
+  "patch_sha256": "d6f2d16bf429b6cb43bf685da028b2da1956171b2f4988b0779c99be6ce61061",
+  "external_candidate_binary_sha256": "a0fdf2b8e1228c80b8c1fcd721e9f67a8240d8ac7cee88edccfbe8d00db6e772",
+  "external_candidate_binary_included": false,
+  "candidate_binary_mtime": "2026-10-04 14:27 local file time",
+  "generate_cpp_mtime": "2026-10-04 14:48 local file time",
+  "built_binary_reproduced_by_this_patch": false
+}

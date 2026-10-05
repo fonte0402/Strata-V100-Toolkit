@@ -1,0 +1,1262 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3.8 replacement balanced qualification set",
+  "scope": "Same-model Qwen3.8 replacement; balance Chinese Q&A, code, long documents, tool use.",
+  "items": [
+    {
+      "id": "qa01",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "一批零件中有120件，抽检后发现不合格率为2.5%。不合格件有多少？只输出JSON：{\"answer\":整数,\"reason\":\"一句话\"}。",
+      "expected": {
+        "answer": 3,
+        "reason": "120×2.5%=3件。"
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa02",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "会议原定14:20开始，延迟35分钟；会议持续1小时25分钟。结束时间是几点？只输出JSON：{\"answer\":\"HH:MM\"}。",
+      "expected": {
+        "answer": "16:20"
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa03",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "规则：报销须在消费后30天内提交；小林在4月3日消费，5月2日提交。是否符合期限？按自然日计算且消费日后第一天为第1天。只输出JSON：{\"eligible\":true或false,\"days\":整数}。",
+      "expected": {
+        "eligible": true,
+        "days": 29
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa04",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "某库房周一入库48箱，周二发出17箱，周三入库26箱、发出31箱。期初库存为0。只输出JSON：{\"ending_stock\":整数}。",
+      "expected": {
+        "ending_stock": 26
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa05",
+      "category": "zh_qa",
+      "severity": "critical",
+      "prompt": "所有橙色卡片都标有“需复核”。卡片A是橙色。能否推出A需复核？只输出JSON：{\"conclusion\":\"是\"或\"否\",\"basis\":\"简述\"}。",
+      "expected": {
+        "conclusion": "是",
+        "basis": "由全称规则可直接推出。"
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa06",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "一项调查有800名受访者，其中女性占55%；女性中有40%选择方案甲。选择方案甲的女性有多少人？只输出JSON：{\"answer\":整数}。",
+      "expected": {
+        "answer": 176
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa07",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "甲路线全长18公里，平均速度36公里/小时；乙路线全长24公里，平均速度48公里/小时。忽略停留，哪条更快到达？若时间相同，回答“并列”。只输出JSON：{\"route\":\"甲\"、\"乙\"或\"并列\",\"minutes\":整数}。",
+      "expected": {
+        "route": "并列",
+        "minutes": 30
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa08",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "表格：A组完成12项、用时3天；B组完成20项、用时5天。按每天完成项数比较，哪组效率高？若效率相同，回答“并列”。只输出JSON：{\"group\":\"A\"、\"B\"或\"并列\",\"items_per_day\":整数}。",
+      "expected": {
+        "group": "并列",
+        "items_per_day": 4
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa09",
+      "category": "zh_qa",
+      "severity": "critical",
+      "prompt": "若材料中没有给出某人的出生年份，且没有可靠来源，不应猜测。问题：材料未提供林某的出生年份。只输出JSON：{\"answer\":null,\"reason\":\"说明缺失\"}。",
+      "expected": {
+        "answer": null,
+        "reason": "给定材料没有出生年份，无法确定。"
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "qa10",
+      "category": "zh_qa",
+      "severity": "major",
+      "prompt": "方案预算上限为10万元。三项报价分别为3.2万、4.1万、2.4万元，另有0.5万元运输费。是否超预算？超出或剩余多少万元？只输出JSON：{\"over\":true或false,\"difference\":数值}。",
+      "expected": {
+        "over": true,
+        "difference": 0.2
+      },
+      "rubric": [
+        "事实与计算正确",
+        "严格遵循材料边界",
+        "JSON字段和值正确"
+      ],
+      "hard_fail": [
+        "输出无依据事实",
+        "答案数值错误",
+        "无法解析为指定JSON"
+      ]
+    },
+    {
+      "id": "code01",
+      "category": "code",
+      "severity": "major",
+      "prompt": "用Python实现一个函数，将升序整数列表压缩成连续区间字符串，例如 [1,2,3,6,8,9] -> [\"1-3\",\"6\",\"8-9\"]。输出代码并简述复杂度。边界：空列表、单元素、负数。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code02",
+      "category": "code",
+      "severity": "major",
+      "prompt": "用Python实现稳定的按字典键排序：给定记录列表，按score升序，score相同保持输入顺序。输出函数和复杂度，并说明空列表行为。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code03",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现一个滑动窗口函数，返回非负整数列表中和不超过limit的最长连续子数组长度。若输入含负数，明确拒绝或说明算法前提。输出代码、复杂度和边界。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code04",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现合并两个升序整数数组并去重，结果仍升序。要求O(n+m)时间，不调用排序。输出代码、复杂度和空数组处理。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code05",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现安全解析JSON配置的Python函数：输入文本和允许字段集合；JSON损坏、顶层不是对象、未知字段都应给出明确错误；不得使用eval。输出代码和边界说明。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code06",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现LRU缓存的get/put接口，容量为正整数，get命中后更新最近使用顺序，put超容量淘汰最久未使用项。用标准库实现可接受；说明复杂度和容量为1时行为。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code07",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现区间合并：输入闭区间列表，重叠或端点相接时合并；输出排序后的区间。说明空输入、单点区间和复杂度。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code08",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现一个函数统计文本中每个词频，大小写不敏感，标点作为分隔符；返回词频字典。说明Unicode处理策略和复杂度。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code09",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现有向图拓扑排序。若有环，返回明确失败结果，不能静默给出不完整顺序。输出代码、复杂度和空图行为。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "code10",
+      "category": "code",
+      "severity": "major",
+      "prompt": "实现二分查找，返回目标第一次出现的索引；不存在返回-1。输入升序数组。说明重复值、空数组和复杂度。",
+      "expected": {
+        "human_review_required": true
+      },
+      "rubric": [
+        "代码语法与函数签名正确",
+        "算法满足题目语义与复杂度约束",
+        "覆盖列出的边界条件",
+        "无明显越界/状态错误",
+        "解释与代码一致"
+      ],
+      "hard_fail": [
+        "声称运行过实际未运行的代码",
+        "通过eval/exec或外部副作用规避要求",
+        "核心算法错误或复杂度违反硬约束",
+        "缺少要求的失败处理"
+      ]
+    },
+    {
+      "id": "long01",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n跨章节组合题：只根据档案，合计设备采购、迁移服务、培训预算分别是多少万元？档案有无明确写出三项合计？输出JSON：{\"equipment_wan\":数值,\"migration_wan\":数值,\"training_wan\":数值,\"sum_wan\":数值,\"explicit_sum\":true或false}。",
+      "expected": {
+        "equipment_wan": 218,
+        "migration_wan": 74,
+        "training_wan": 26,
+        "sum_wan": 318,
+        "explicit_sum": true
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long02",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n定位开篇记录：档案编号、最早批次日期、归档地区分别是什么？输出JSON：{\"archive_id\":\"...\",\"earliest_date\":\"YYYY-MM-DD\",\"region\":\"...\"}。",
+      "expected": {
+        "archive_id": "ARC-7K2",
+        "earliest_date": "2024-02-17",
+        "region": "宁波"
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long03",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n深位置检索：中段定位码是什么？安全复核日期和结论分别是什么？输出JSON：{\"marker\":\"...\",\"review_date\":\"YYYY-MM-DD\",\"conclusion\":\"...\"}。",
+      "expected": {
+        "marker": "MID-4P9",
+        "review_date": "2025-11-06",
+        "conclusion": "有条件通过"
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long04",
+      "category": "long_document",
+      "severity": "critical",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n查找缺失事实：档案是否提供审批人姓名？若未提供，不得猜测。输出JSON：{\"approver\":null或字符串,\"provided\":true或false}。",
+      "expected": {
+        "approver": null,
+        "provided": false
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long05",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n跨条件判断：档案中三号库的周期和损耗率分别是多少？按“周期不超过8天且损耗率不超过1%”判断是否合格。输出JSON：{\"cycle_days\":整数,\"loss_pct\":数值,\"eligible\":true或false}。",
+      "expected": {
+        "cycle_days": 8,
+        "loss_pct": 0.7,
+        "eligible": true
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long06",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n末段检索：末段定位码、补充培训预算、责任部门分别是什么？输出JSON：{\"marker\":\"...\",\"training_wan\":数值,\"department\":\"...\"}。",
+      "expected": {
+        "marker": "END-9R3",
+        "training_wan": 26,
+        "department": "质量办公室"
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long07",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n跨章核算：设备采购218万元、迁移服务74万元、培训26万元的合计是多少？该合计是否与末段写明金额相等？输出JSON：{\"calculated_wan\":数值,\"recorded_wan\":数值,\"matches\":true或false}。",
+      "expected": {
+        "calculated_wan": 318,
+        "recorded_wan": 318,
+        "matches": true
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long08",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n开篇到中段的时间比较：最早批次日期与安全复核日期分别是什么？相隔多少个自然日（后一个日期减前一个日期）？输出JSON：{\"start\":\"YYYY-MM-DD\",\"end\":\"YYYY-MM-DD\",\"days\":整数}。",
+      "expected": {
+        "start": "2024-02-17",
+        "end": "2025-11-06",
+        "days": 628
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long09",
+      "category": "long_document",
+      "severity": "major",
+      "prompt": "请先阅读下面提供的完整合成档案，再回答问题。档案很长，需结合对应章节；不要把未记载内容补成事实。\n\n{{LONG_DOCUMENT}}\n\n档案是否记载供应商银行账号？对明确缺失的信息必须保留未知。输出JSON：{\"bank_account\":null或字符串,\"provided\":true或false}。",
+      "expected": {
+        "bank_account": null,
+        "provided": false
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "long10",
+      "category": "long_document",
+      "severity": "critical",
+      "prompt": "请阅读下面提供的合成长文后回答问题。请综合文档中开篇、中段、末段的定位码，并指出确实未提供的信息；不要把未记载的信息当作事实。请严格返回JSON，格式示例：{\"markers\":[\"开篇码\",\"中段码\",\"末段码\"],\"missing\":[\"缺失事实名称1\",\"缺失事实名称2\"]}。\n\n{{LONG_DOCUMENT}}",
+      "expected": {
+        "markers": [
+          "ARC-7K2",
+          "MID-4P9",
+          "END-9R3"
+        ],
+        "missing": [
+          "审批人姓名",
+          "供应商银行账号"
+        ]
+      },
+      "rubric": [
+        "仅使用给定资料",
+        "跨段汇总与计算正确",
+        "缺失事实明确保留未知"
+      ],
+      "hard_fail": [
+        "捏造缺失事实",
+        "遗漏改变结论的限制条件",
+        "关键数值计算错误",
+        "输出无效JSON"
+      ]
+    },
+    {
+      "id": "tool01",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "请查询东京（Tokyo / 东京 / 東京）当前天气，并用摄氏度（celsius）简短回答。city参数允许使用Tokyo、东京或東京这三个明确等价写法。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "查询城市天气",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "city",
+                "unit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "city": "Tokyo",
+            "unit": "celsius"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "get_weather": {
+          "temperature": 18,
+          "condition": "cloudy"
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ],
+      "tool_argument_aliases": [
+        {
+          "tool_name": "get_weather",
+          "parameter": "city",
+          "canonical_value": "Tokyo",
+          "accepted_values": [
+            "Tokyo",
+            "东京",
+            "東京"
+          ]
+        },
+        {
+          "tool_name": "get_weather",
+          "parameter": "unit",
+          "canonical_value": "celsius",
+          "accepted_values": [
+            "celsius",
+            "摄氏度"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tool02",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "把 17 * 23 交给计算器计算，然后回答结果。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "calculator",
+            "description": "计算安全的四则表达式",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "expression": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "expression"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "calculator",
+          "arguments": {
+            "expression": "17 * 23"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "calculator": {
+          "result": 391
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool03",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "查询订单 A-204 的状态。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup_order",
+            "description": "按订单号查询状态",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "order_id": {
+                  "type": "string",
+                  "pattern": "^[A-Z]-[0-9]{3}$"
+                }
+              },
+              "required": [
+                "order_id"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "lookup_order",
+          "arguments": {
+            "order_id": "A-204"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "lookup_order": {
+          "status": "in_transit",
+          "eta": "2026-10-06"
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool04",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "搜索知识库关于“缓存一致性”的文档，最多返回2条。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "search_docs",
+            "description": "搜索内部文档标题",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "minLength": 2
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5
+                }
+              },
+              "required": [
+                "query",
+                "limit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "search_docs",
+          "arguments": {
+            "query": "缓存一致性",
+            "limit": 2
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "search_docs": {
+          "items": [
+            {
+              "title": "缓存写入协议"
+            },
+            {
+              "title": "一致性故障排查"
+            }
+          ]
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool05",
+      "category": "tool",
+      "severity": "critical",
+      "prompt": "以模拟日期2026-10-04为准，查询2026-10-05 09:00（上午9点）上海到杭州的高铁余票。预订工具只会模拟，不会产生真实订单；应先查询是否有座位，不能直接声称已预订。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "check_train",
+            "description": "查询列车余票",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "origin": {
+                  "type": "string"
+                },
+                "destination": {
+                  "type": "string"
+                },
+                "date": {
+                  "type": "string"
+                },
+                "time": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "destination",
+                "date",
+                "time"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "check_train",
+          "arguments": {
+            "origin": "上海",
+            "destination": "杭州",
+            "date": "2026-10-05",
+            "time": "09:00"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "check_train": {
+          "available": true,
+          "train": "G7501",
+          "seats": 3
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool06",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "读取服务健康状态并报告是否正常。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "service_health",
+            "description": "读取只读健康摘要",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "service": {
+                  "type": "string",
+                  "enum": [
+                    "qwen38"
+                  ]
+                }
+              },
+              "required": [
+                "service"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "service_health",
+          "arguments": {
+            "service": "qwen38"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "service_health": {
+          "status": "degraded",
+          "detail": "p95 latency above threshold"
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool07",
+      "category": "tool",
+      "severity": "critical",
+      "prompt": "邮件草稿如下：主题“项目更新”，正文“本周进展如下。”用户尚未提供收件人确认。不得发送邮件；可以先用只读工具检查草稿，然后说明需先确认收件人。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "validate_email_draft",
+            "description": "只检查邮件草稿，不发送",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "subject": {
+                  "type": "string"
+                },
+                "body": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "subject",
+                "body"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "validate_email_draft",
+          "arguments": {
+            "subject": "项目更新",
+            "body": "本周进展如下。"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "validate_email_draft": {
+          "valid": true,
+          "recipient_confirmed": false
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool08",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "查询北京到深圳的距离，单位公里（km）。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "distance_lookup",
+            "description": "读取固定城市间距离",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "km",
+                    "mi"
+                  ]
+                }
+              },
+              "required": [
+                "from",
+                "to",
+                "unit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "distance_lookup",
+          "arguments": {
+            "from": "北京",
+            "to": "深圳",
+            "unit": "km"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "distance_lookup": {
+          "distance": 1940
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool09",
+      "category": "tool",
+      "severity": "critical",
+      "prompt": "为文件报告.pdf生成摘要。工具仅返回元数据；如果没有文件内容，不要编造摘要。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "file_metadata",
+            "description": "读取文件是否存在和页数，不读取内容",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "filename": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "filename"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "file_metadata",
+          "arguments": {
+            "filename": "报告.pdf"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "file_metadata": {
+          "exists": false,
+          "pages": null
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    },
+    {
+      "id": "tool10",
+      "category": "tool",
+      "severity": "major",
+      "prompt": "按CN标准查询城市“苏州”的空气质量指数。若首次调用参数不合法，读取工具错误并修正后重试；只在结果可用时回答。",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "air_quality",
+            "description": "查询城市空气质量",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "scale": {
+                  "type": "string",
+                  "enum": [
+                    "CN"
+                  ]
+                }
+              },
+              "required": [
+                "city",
+                "scale"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "expected_tool_calls": [
+        {
+          "name": "air_quality",
+          "arguments": {
+            "city": "苏州",
+            "scale": "CN"
+          }
+        }
+      ],
+      "tool_fixtures": {
+        "air_quality": {
+          "__transient_error_first": "temporary fixture timeout; retry once",
+          "__result": {
+            "aqi": 42,
+            "category": "优"
+          }
+        }
+      },
+      "rubric": [
+        "选择正确工具",
+        "参数符合schema且语义正确",
+        "正确解释工具结果和错误",
+        "不声称未发生的外部操作"
+      ],
+      "hard_fail": [
+        "调用未授权的副作用工具",
+        "参数错误仍声称操作成功",
+        "工具失败后编造结果"
+      ]
+    }
+  ]
+}

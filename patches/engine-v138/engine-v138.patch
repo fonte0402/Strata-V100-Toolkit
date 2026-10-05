@@ -1,0 +1,786 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff8766b..72f0b8c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -66,6 +66,15 @@
+   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
+   target_include_directories(conversation_memory_test PRIVATE include)
+   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
++endif()
++
++# sized-slot capacity regression (one CUDA device, ~16 MiB; file header)
++if(STRATA_ENABLE_CUDA)
++  add_executable(expert_cache_sized_test src/core/expert_cache_sized_test.cpp src/core/expert_cache.cpp)
++  target_include_directories(expert_cache_sized_test PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
++  target_link_libraries(expert_cache_sized_test PRIVATE CUDA::cudart)
++  target_link_options(expert_cache_sized_test PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/STACK:67108864>)
++  add_test(NAME expert_cache_sized_test COMMAND expert_cache_sized_test)
+ endif()
+ 
+ if(STRATA_ENABLE_CUDA)
+
+diff --git a/include/strata/core/expert_cache.hpp b/include/strata/core/expert_cache.hpp
+index 4a70835..33f2d9e 100644
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -129,6 +129,9 @@
+     /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
+     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
+ 
++    /// Bytes this slot may hold: its entry in the sized table (off_), or the uniform blob size.
++    int64_t slot_capacity(int32_t slot) const;
++
+     /// The device address of one slot.
+     uint8_t* device_slot(int32_t slot);
+     const uint8_t* device_slot(int32_t slot) const;
+
+diff --git a/src/core/expert_cache.cpp b/src/core/expert_cache.cpp
+index dc64443..a281832 100644
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -336,8 +336,28 @@
+     return base_ + (size_t) slot * (size_t) blob_;
+ }
+ 
++int64_t ExpertCache::slot_capacity(int32_t slot) const {
++    if (slot < 0 || slot >= slots_) return 0;
++    if (!off_.empty()) return (int64_t) (off_[(size_t) slot + 1] - off_[(size_t) slot]);
++    return blob_;
++}
++
+ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
+     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
++    if (bytes > blob_) {
++        err = "ExpertCache::fill_slot: the caller's blob is larger than the largest slot - refusing instead of "
++              "silently truncating to the slot size";
++        return false;
++    }
++    if ((int64_t) n > slot_capacity(slot)) {
++        char buf[224];
++        std::snprintf(buf, sizeof buf,
++                      "ExpertCache::fill_slot: %zd bytes into slot %d of capacity %lld - the slot table does not "
++                      "match the admission policy; refusing instead of overrunning the next slot",
++                      n, (int) slot, (long long) slot_capacity(slot));
++        err = buf;
++        return false;
++    }
+     uint8_t* dst = device_slot(slot);
+     if (dst == nullptr) {
+         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
+@@ -360,6 +380,20 @@
+ 
+ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
++    if (bytes > blob_) {
++        err = "ExpertCache::fill_slot_blocking: the caller's blob is larger than the largest slot - refusing instead of "
++              "silently truncating to the slot size";
++        return false;
++    }
++    if ((int64_t) n > slot_capacity(slot)) {
++        char buf[224];
++        std::snprintf(buf, sizeof buf,
++                      "ExpertCache::fill_slot_blocking: %zd bytes into slot %d of capacity %lld - the slot table does not "
++                      "match the admission policy; refusing instead of overrunning the next slot",
++                      n, (int) slot, (long long) slot_capacity(slot));
++        err = buf;
++        return false;
++    }
+     uint8_t* dst = device_slot(slot);
+     if (dst == nullptr) {
+         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
+@@ -391,6 +425,20 @@
+ 
+ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
++    if (bytes > blob_) {
++        err = "ExpertCache::fill_slot_queued: the caller's blob is larger than the largest slot - refusing instead of "
++              "silently truncating to the slot size";
++        return false;
++    }
++    if ((int64_t) n > slot_capacity(slot)) {
++        char buf[224];
++        std::snprintf(buf, sizeof buf,
++                      "ExpertCache::fill_slot_queued: %zd bytes into slot %d of capacity %lld - the slot table does not "
++                      "match the admission policy; refusing instead of overrunning the next slot",
++                      n, (int) slot, (long long) slot_capacity(slot));
++        err = buf;
++        return false;
++    }
+     uint8_t* dst = device_slot(slot);
+     if (dst == nullptr || host_blob == nullptr) {
+         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
+@@ -416,10 +464,14 @@
+ }
+ 
+ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
++    const int64_t nb = bytes > 0 ? bytes : blob_;
+     const uint8_t* src = device_slot(slot);
+     if (src == nullptr) {
+         err = "ExpertCache::verify_slot: slot outside the arena";
++        return false;
++    }
++    if (host_blob == nullptr || nb > blob_ || nb > slot_capacity(slot)) {
++        err = "ExpertCache::verify_slot: null source or readback exceeds the slot capacity";
+         return false;
+     }
+     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
+
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a7c77d0..e83416a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -363,6 +363,7 @@
+     /// spec-1 drafts); 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for
+     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
+     int spec = 0;
++    bool verify_single_step = false;  // same target verifier and allocation, no decode drafts
+     std::string spec_oracle;
+     int spec_corrupt = 0;
+     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
+@@ -522,6 +523,7 @@
+                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+                  "                       when it pays (default 3; 0 = MTP only)\n"
+                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
++                 "  --verify-single-step diagnostic: same verifier allocation, T=1, no decode drafts\n"
+                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
+                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
+                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
+@@ -1220,6 +1222,7 @@
+         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
+         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
++        else if (a == "--verify-single-step") o.verify_single_step = true;
+         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+         else if (a == "--stop-eos") o.stop_eos = true;
+@@ -1346,6 +1349,13 @@
+         }
+     }
+     strata::core::set_coupled_draft(o.coupled_draft);
++    if (o.verify_single_step) {
++        if (o.spec < 2) {
++            std::fprintf(stderr, "strata: --verify-single-step requires --spec >= 2\n");
++            return 2;
++        }
++        std::fprintf(stderr, "strata: VERIFY_SINGLE_STEP=1: target verifier T=1; decode MTP and suffix drafts disabled; allocation unchanged\n");
++    }
+     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
+         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
+@@ -4766,29 +4776,64 @@
+         cudaEvent_t adapt_ev = nullptr;
+         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
+-        auto res_upload = [&]() {
++        auto res_upload = [&]() -> bool {
+             if (d_res != nullptr)
+-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
++                if (cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
++                    return false;
+             for (auto& st : stages) {
+                 const strata::core::OnDevice on(st->dev);
+-                cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+-            }
++                if (cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
++                    return false;
++            }
++            return true;
+         };
+-        auto apply_pending = [&](bool wait) {
++        auto apply_pending = [&](bool wait) -> bool {
+             if (peer.valid()) peer.apply_pending(wait);
+-            if (pending.empty()) return;
+-            if (wait) cudaEventSynchronize(adapt_ev);
+-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
++            if (pending.empty()) return true;
++            const cudaError_t landed = wait ? cudaEventSynchronize(adapt_ev) : cudaEventQuery(adapt_ev);
++            if (!wait && landed == cudaErrorNotReady) return true;
++            if (landed != cudaSuccess) {
++                std::fprintf(stderr, "strata serve: adaptive copy did not complete: %s\n", cudaGetErrorString(landed));
++                return false; // never publish an expert whose copy failed
++            }
+             for (auto& st : stages)
+                 if (st->adapt_live) {
+-                    if (wait) cudaEventSynchronize(st->adapt_ev);
+-                    else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
++                    const strata::core::OnDevice on(st->dev);
++                    const cudaError_t done = wait ? cudaEventSynchronize(st->adapt_ev) : cudaEventQuery(st->adapt_ev);
++                    if (!wait && done == cudaErrorNotReady) return true;
++                    if (done != cudaSuccess) {
++                        std::fprintf(stderr, "strata serve: stage adaptive copy did not complete: %s\n", cudaGetErrorString(done));
++                        return false;
++                    }
+                 }
+             for (auto& st : stages) st->adapt_live = false;
++            // Opt-in readback audit, after completion and before publishing residency.
++            // Sample the first/last swap; keep this off for production timing.
++            static const bool audit_swaps = [] {
++                const char* v = std::getenv("STRATA_ADAPT_VERIFY");
++                return v != nullptr && std::strcmp(v, "1") == 0;
++            }();
++            if (audit_swaps) {
++                const size_t samples = std::min<size_t>(2, pending.size());
++                for (size_t sample = 0; sample < samples; ++sample) {
++                    const auto [i, slot] = pending[sample == 0 ? 0 : pending.size() - 1];
++                    const int32_t layer = i / (int32_t) g.n_expert, expert = i % (int32_t) g.n_expert;
++                    const int stn = multi_gpu ? stage_of(layer) : 0;
++                    GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
++                    const strata::core::OnDevice on(gs ? gs->dev : -1);
++                    if (!(gs ? gs->cache : xcache).verify_slot(slot, srcp->blob(layer, expert), err,
++                                                             strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
++                        std::fprintf(stderr, "strata serve: ADAPT_VERIFY failed: %s\n", err.c_str());
++                        return false;
++                    }
++                }
++                std::fprintf(stderr, "strata serve: ADAPT_VERIFY checked %zu of %zu pending copies, PASS\n",
++                             samples, pending.size());
++            }
+             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
+             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+             pending.clear();
+-            res_upload();
++            return res_upload();
+         };
+         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+         auto adapt = [&]() -> bool {
+@@ -4826,22 +4871,23 @@
+                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
+                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                 const strata::core::OnDevice on(gs ? gs->dev : -1);
++                // Use the capacity-checked copy API for adaptive swaps too.
++                // Raw copies bypassed the sized-slot guard used by initial fills.
+                 if (slot < 0 || b == nullptr ||
+-                    cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+-                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+-                                    cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess)
++                    !(gs ? gs->cache : xcache).fill_slot(slot, b, gs ? gs->adapt_stream : adapt_stream, err,
++                                                       strata::kernels::cpu::expert_layout().blob_bytes(s.layer)))
+                     return false;
+                 if (gs) gs->adapt_live = true;
+                 else main_live = true;
+                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+             }
+-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
++            if (!swaps.empty() && cudaEventRecord(adapt_ev, adapt_stream) != cudaSuccess) return false;
+             (void) main_live;
+             for (auto& st : stages)
+                 if (st->adapt_live) {
+                     const strata::core::OnDevice on(st->dev);
+-                    cudaEventRecord(st->adapt_ev, st->adapt_stream);
++                    if (cudaEventRecord(st->adapt_ev, st->adapt_stream) != cudaSuccess) return false;
+                 }
+             // #477: the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its
+             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
+@@ -4972,20 +5018,25 @@
+             // disjoint by construction (remote_experts.cpp skips any pair a stage already claimed), so they add.
+             const int64_t slots_primary = (int64_t) xcache.slots();
+             const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
++            int64_t bytes_all = (int64_t) xcache.bytes();
+             int64_t slots_all = slots_primary, mib_all = mib_primary;
+             for (const auto& st : stages) {
+                 slots_all += (int64_t) st->cache.slots();
+                 mib_all += (int64_t) (st->cache.bytes() >> 20);
++                bytes_all += (int64_t) st->cache.bytes();
+             }
+             for (int r = 0; r < 3; ++r)
+                 if (o.expert_cache_remote[(size_t) r] > 0) {
+                     slots_all += remote_experts[(size_t) r].resident();
+                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
++                    bytes_all += (int64_t) (remote_experts[(size_t) r].gib() * 1073741824.0);
+                 }
+             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+-                        "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
++                        "spec_min_p=%.2f expert_cache_bytes=%lld expert_cache_primary_bytes=%lld "
++                        "verify_single_step=%d pool_affinity=%s adapt_every=%d adapt_swaps=%d "
++                        "conversation_cache_mib=%lld conversation_cache_slots=%d "
+                         "conversation_cache_min_free_mib=%lld engine=" STRATA_VERSION "\n",
+                         (long long) o.max_context, o.kv.c_str(),
+                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+@@ -4996,7 +5047,12 @@
+                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                         pool.workers(), o.pcie_frac,
+-                        o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
++                        o.spec_min_p, (long long) bytes_all, (long long) xcache.bytes(),
++                        (int) o.verify_single_step,
++                        o.pool_affinity == strata::kernels::cpu::PoolAffinity::All ? "all" :
++                        o.pool_affinity == strata::kernels::cpu::PoolAffinity::PCores ? "p-cores" : "auto",
++                        o.adapt_every, o.adapt_swaps,
++                        (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                         (long long) o.conversation_cache_min_free_mib);
+         }
+         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
+@@ -5501,7 +5557,10 @@
+                     for (PfPart& p : pf_parts)
+                         if (!p.lent.empty() && !refill_one(p, e)) return false;
+                 }
+-                if (n_parts > 0) res_upload();
++                if (n_parts > 0 && !res_upload()) {
++                    e = "the expert residency table upload failed";
++                    return false;
++                }
+                 if (trace && n_parts > 0) {
+                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                                  (long long) n_lent, (long long) n_parts,
+@@ -5553,7 +5612,7 @@
+                         }
+                     p.lent_chunk = want;
+                 }
+-                if (any) res_upload();
++                if (any && !res_upload()) return false;
+                 if (trace) {
+                     int64_t n_lent = 0;
+                     for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
+@@ -5563,7 +5622,7 @@
+                 }
+                 return true;
+             };
+-            apply_pending(true);
++            if (!apply_pending(true)) return 1;
+             // per-request sampling for the verify window's head (greedy when temperature is absent)
+             strata::kernels::SamplerParams req_sp;
+             req_sp.greedy = req_temperature <= 0.0f;
+@@ -5666,7 +5725,7 @@
+             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
+             std::vector<float> dprob((size_t) S, 0.0f);
+             std::vector<int32_t> sbuf((size_t) S, 0);
+-            if (o.suffix_draft > 0) {
++            if (o.suffix_draft > 0 && !o.verify_single_step) {
+                 sfx.reset();
+                 for (int64_t t : ids) sfx.append((int32_t) t);
+             }
+@@ -5705,12 +5764,12 @@
+                     T = 1;
+                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                 }
+-                if (first_window) T = 1;
++                if (first_window || o.verify_single_step) T = 1;
+                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
+                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+                 bool from_sfx = false;
+                 int sfx_match = 0;
+-                if (o.suffix_draft > 0 && !first_window) {
++                if (o.suffix_draft > 0 && !first_window && !o.verify_single_step) {
+                     const int k = sfx.propose(S - 1, sbuf.data());
+                     sfx_match = sfx.last_match();
+                     if (k > 0 && sbuf[0] == drafts[0]) {
+@@ -5729,7 +5788,7 @@
+                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
+                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
+                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+-                apply_pending(!adapt_nowait());
++                if (!apply_pending(!adapt_nowait())) return 1;
+                 if (hist_n > 0) {
+                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
+                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
+@@ -5770,7 +5829,7 @@
+                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                     strata::core::progress_beat();
+                     ++produced_n;
+-                    if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
++                    if (o.suffix_draft > 0 && !o.verify_single_step) sfx.append(outv[(size_t) i]);
+                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                 }
+                 std::fflush(stdout);
+@@ -5778,9 +5837,9 @@
+                 const Clock::time_point tw2 = Clock::now();
+                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
+                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
+-                if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
++                if (hist_n > 0 && mtp.coupled() && !o.verify_single_step && !eos && produced_n < max_new)
+                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+-                const bool drafted = eos || produced_n >= max_new ||
++                const bool drafted = o.verify_single_step || eos || produced_n >= max_new ||
+                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                 {
+                     const Clock::time_point tw3 = Clock::now();
+@@ -6434,16 +6493,20 @@
+         cudaEvent_t adapt_ev = nullptr;
+         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
+-        auto apply_pending = [&](bool wait) {
+-            if (pending.empty()) return;
++        auto apply_pending = [&](bool wait) -> bool {
++            if (pending.empty()) return true;
+             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
+             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
+-            if (wait) cudaEventSynchronize(adapt_ev);
+-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
++            const cudaError_t landed = wait ? cudaEventSynchronize(adapt_ev) : cudaEventQuery(adapt_ev);
++            if (!wait && landed == cudaErrorNotReady) {
+                 if (trace_pending)
+                     std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
+                                  pending.size());
+-                return;
++                return true;
++            }
++            if (landed != cudaSuccess) {
++                std::fprintf(stderr, "strata generate: adaptive copy did not complete: %s\n", cudaGetErrorString(landed));
++                return false;
+             }
+             if (trace_pending)
+                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
+@@ -6451,7 +6514,9 @@
+             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+             pending.clear();
+             if (d_res != nullptr)
+-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
++                if (cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
++                    return false;
++            return true;
+         };
+         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
+         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
+@@ -6504,15 +6569,15 @@
+                 const uint8_t* b = srcp->blob(s.layer, s.in);
+                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
+                 if (slot < 0 || b == nullptr ||
+-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+-                                    cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
++                    !xcache.fill_slot(slot, b, adapt_stream, err,
++                                     strata::kernels::cpu::expert_layout().blob_bytes(s.layer))) {
+                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
+                     return false;
+                 }
+                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+             }
+-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
++            if (!swaps.empty() && cudaEventRecord(adapt_ev, adapt_stream) != cudaSuccess) return false;
+             if (trace_adapt)
+                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
+                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
+@@ -6529,7 +6594,7 @@
+         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
+         // generated token and the MTP's first cell); otherwise the token loop already did that.
+         bool first_window = native_pack;
+-        if (use_mtp && !first_window &&
++        if (use_mtp && !first_window && !o.verify_single_step &&
+             !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+@@ -6543,7 +6608,7 @@
+         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+         std::vector<int32_t> sbuf((size_t) o.spec, 0);
+         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+-        if (o.suffix_draft > 0) {
++        if (o.suffix_draft > 0 && !o.verify_single_step) {
+             for (int64_t t : o.tokens) sfx.append((int32_t) t);
+             for (int64_t t : produced) sfx.append((int32_t) t);
+         }
+@@ -6556,10 +6621,10 @@
+                 T = 1;
+                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+             }
+-            if (first_window) T = 1;
++            if (first_window || o.verify_single_step) T = 1;
+             bool from_sfx = false;
+             int sfx_match = 0;
+-            if (o.suffix_draft > 0 && !first_window) {
++            if (o.suffix_draft > 0 && !first_window && !o.verify_single_step) {
+                 const int k = sfx.propose(o.spec - 1, sbuf.data());
+                 sfx_match = sfx.last_match();
+                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+@@ -6587,7 +6652,7 @@
+             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
+             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
+             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+-            apply_pending(!adapt_nowait());
++            if (!apply_pending(!adapt_nowait())) return 1;
+             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                 return 1;
+@@ -6633,7 +6698,7 @@
+             bool eos = false;
+             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
+                 produced.push_back(outv[(size_t) i]);
+-                if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
++                if (o.suffix_draft > 0 && !o.verify_single_step) sfx.append(outv[(size_t) i]);
+                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+             }
+             if (eos) {
+@@ -6641,7 +6706,7 @@
+                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                 break;
+             }
+-            const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
++            const bool drafted = o.verify_single_step || !use_mtp || (int64_t) produced.size() >= o.max_new ||
+                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+             if (adapt_thr.joinable()) adapt_thr.join();
+             if (!adapt_ok) return 1;
+
+diff --git a/src/core/expert_cache_sized_test.cpp b/src/core/expert_cache_sized_test.cpp
+new file mode 100644
+index 0000000..703c725
+--- /dev/null
++++ b/src/core/expert_cache_sized_test.cpp
+@@ -0,0 +1,265 @@
++// src/core/expert_cache_sized_test.cpp - capacity-hardening regression for the sized slot table.
++//
++// v0.1.34 already seeds open_sized's per-layer cursors correctly (#369) and disables the sized table under
++// per-layer admission in generate.cpp.  What this file pins down is the LAYER BELOW both fixes: whatever two
++// orders a caller combines, a fill that does not fit its slot must be REFUSED, not silently overrunning the
++// next slot.  Sections:
++//   1. rank-order sizing + per-layer fill (the mismatched pair): the capacity guard must fire - fail loud.
++//   2. assignment-first sizing + per-layer fill: clean.
++//   3. rank-order sizing + global admission: clean (the orders agree; the engine's sized-table path).
++//   4. per-layer with uniform slots < layers: empty ranges admit nothing (refusal), no crash, no overrun.
++//   5. duplicate admit: the same pair maps to the same slot; refilling it verifies.
++//   6. bytes > blob_: refused as a caller error, never silently truncated.
++// Needs one CUDA device (~16 MiB).  Exit 0 = every section behaved as labelled.
++
++#include "strata/core/expert_cache.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++using strata::core::ExpertCache;
++using strata::core::kNotResident;
++
++namespace {
++
++constexpr int kLayers = 48;
++constexpr int kExperts = 16;
++constexpr int kSlotsPerLayer = 4;
++constexpr int kSlots = kLayers * kSlotsPerLayer;   // 192
++constexpr int kPairs = 96;
++
++int64_t layer_blob(int layer) { return (layer % 2 == 0) ? 14576 : 18176; }
++
++std::vector<std::pair<int32_t, int32_t>> make_profile() {
++    std::vector<std::pair<int32_t, int32_t>> ranked;
++    ranked.reserve(kPairs);
++    for (int i = 0; i < kPairs; ++i)
++        ranked.emplace_back((int32_t) ((i * 7) % kLayers), (int32_t) ((i * 3) % kExperts));
++    return ranked;
++}
++
++std::vector<int64_t> rank_order_sized(const std::vector<std::pair<int32_t, int32_t>>& profile) {
++    std::vector<int64_t> sized;
++    sized.reserve(kSlots);
++    for (int s = 0; s < kSlots; ++s)
++        sized.push_back(layer_blob(profile[(size_t) (s % profile.size())].first));
++    return sized;
++}
++
++std::vector<int64_t> assignment_first_sized(const std::vector<std::pair<int32_t, int32_t>>& profile) {
++    std::vector<int64_t> sized((size_t) kSlots, -1);
++    std::vector<int32_t> layer_next((size_t) kLayers);
++    for (int l = 0; l < kLayers; ++l) layer_next[(size_t) l] = (int32_t) (l * (kSlots / kLayers));
++    for (const auto& pr : profile) {
++        const int64_t q = kSlots / kLayers;
++        const int64_t lo = (int64_t) pr.first * q;
++        const int64_t hi = (pr.first == kLayers - 1) ? kSlots : lo + q;
++        if ((int64_t) layer_next[(size_t) pr.first] >= hi) break;
++        sized[(size_t) layer_next[(size_t) pr.first]++] = layer_blob(pr.first);
++    }
++    for (int s = 0; s < kSlots; ++s) {
++        if (sized[(size_t) s] < 0) {
++            int64_t layer = (int64_t) s / kSlotsPerLayer;
++            if (layer >= kLayers) layer = kLayers - 1;
++            sized[(size_t) s] = layer_blob((int) layer);
++        }
++    }
++    return sized;
++}
++
++struct Outcome {
++    int filled = 0;
++    int guard_refusals = 0;     // fills refused by the capacity guard (fail-loud) or the bytes>blob_ guard
++    int overlap_slots = 0;
++    bool pair0_ok = false;
++    std::string first_overlap, first_refusal, pair0_err;
++};
++
++Outcome run_fill(const std::vector<int64_t>& sized, const std::vector<std::pair<int32_t, int32_t>>& profile,
++                 bool per_layer) {
++    Outcome o;
++    std::vector<std::vector<uint8_t>> blobs((size_t) kLayers);
++    for (int l = 0; l < kLayers; ++l) blobs[(size_t) l].assign((size_t) layer_blob(l), (uint8_t) (0x10 + l));
++
++    ExpertCache xc;
++    std::string err;
++    if (!xc.open_sized(sized, kLayers, kExperts, err)) {
++        o.first_overlap = std::string("open_sized failed: ") + err;
++        o.overlap_slots = -1;
++        return o;
++    }
++    xc.set_per_layer_admission(per_layer);
++
++    std::vector<std::pair<int32_t, int32_t>> written;   // pairs whose fill succeeded
++    for (const auto& pr : profile) {
++        const int32_t slot = xc.admit(pr.first, pr.second);
++        if (slot == kNotResident) break;
++        if (!xc.fill_slot_blocking(slot, blobs[(size_t) pr.first].data(), err, layer_blob(pr.first))) {
++            if (err.find("refusing") != std::string::npos || err.find("larger than the largest slot") != std::string::npos) {
++                ++o.guard_refusals;
++                if (o.first_refusal.empty()) o.first_refusal = err;
++                continue;    // the guard: this pair stays un-resident-in-bytes; keep draining the rest
++            }
++            o.first_overlap = std::string("fill failed: ") + err;
++            o.overlap_slots = -1;
++            return o;
++        }
++        written.push_back(pr);
++        ++o.filled;
++    }
++
++    for (int s = 0; s < kSlots; ++s) {
++        int owner_layer = -1;
++        bool owner_written = false;
++        for (const auto& pr : profile)
++            if (xc.slot_of(pr.first, pr.second) == s) {
++                owner_layer = pr.first;
++                for (const auto& w : written)
++                    if (w == pr) { owner_written = true; break; }
++                break;
++            }
++        const size_t cap = (size_t) sized[(size_t) s];
++        // a slot whose owner's fill was GUARD-REFUSED was never written: it must read zero.  A written
++        // slot holds its owner's pattern over blob_bytes(owner) and zeros in any capacity padding beyond.
++        std::vector<uint8_t> got(cap, 0xEE), want(cap, 0);
++        if (owner_layer >= 0 && owner_written)
++            std::fill(want.begin(), want.begin() + (size_t) layer_blob(owner_layer), (uint8_t) (0x10 + owner_layer));
++        if (cudaMemcpy(got.data(), xc.device_slot(s), cap, cudaMemcpyDeviceToHost) != cudaSuccess) {
++            o.first_overlap = std::string("D2H failed: ") + cudaGetErrorString(cudaGetLastError());
++            o.overlap_slots = -1;
++            return o;
++        }
++        if (std::memcmp(got.data(), want.data(), cap) != 0) {
++            size_t at = 0;
++            while (at < cap && got[at] == want[at]) ++at;
++            if (o.overlap_slots < 6) {
++                char buf[320];
++                std::snprintf(buf, sizeof buf,
++                    "slot %d owner_layer %d owner_written %d cap %zd first_diff %zd got[diff..]=%02x %02x want=%02x %02x got[tail-8]=%02x want[tail-8]=%02x",
++                    s, owner_layer, (int) owner_written, cap, at,
++                    got[at], at + 1 < cap ? got[at + 1] : 0, want[at], at + 1 < cap ? want[at + 1] : 0,
++                    got[cap - 8], want[cap - 8]);
++                o.first_overlap += std::string(buf) + "\n";
++            }
++            ++o.overlap_slots;
++        }
++    }
++
++    o.pair0_ok = xc.verify_slot(xc.slot_of(profile[0].first, profile[0].second),
++                                blobs[(size_t) profile[0].first].data(), o.pair0_err, layer_blob(profile[0].first));
++    return o;
++}
++
++}  // namespace
++
++int main() {
++    const auto profile = make_profile();
++    int bad = 0;
++
++    std::printf("== 1. rank-order sizing + per-layer fill: the guard must fire (fail loud) ==\n");
++    {
++        const Outcome o = run_fill(rank_order_sized(profile), profile, true);
++        std::printf("filled %d, guard refusals %d, overlap %d, pair-0 %s\n", o.filled, o.guard_refusals,
++                    o.overlap_slots, o.pair0_ok ? "PASS" : "FAIL");
++        if (!o.first_refusal.empty()) std::printf("first refusal: %s\n", o.first_refusal.c_str());
++        if (!o.first_overlap.empty()) std::printf("overlap detail:\n%s", o.first_overlap.c_str());
++        // the mismatched orders must NOT go through silently
++        if (o.guard_refusals == 0 || o.overlap_slots != 0) { std::printf("WRONG: silent path\n"); ++bad; }
++        else std::printf("(refused fills leave dangling residency; those slots read zero - documented API hazard)\n");
++    }
++
++    std::printf("== 2. assignment-first sizing + per-layer fill: clean ==\n");
++    {
++        const Outcome o = run_fill(assignment_first_sized(profile), profile, true);
++        std::printf("filled %d, guard refusals %d, overlap %d, pair-0 %s\n", o.filled, o.guard_refusals,
++                    o.overlap_slots, o.pair0_ok ? "PASS" : "FAIL");
++        if (o.overlap_slots != 0 || !o.pair0_ok || o.guard_refusals != 0) ++bad;
++    }
++
++    std::printf("== 3. rank-order sizing + global admission: clean (the engine's sized path) ==\n");
++    {
++        const Outcome o = run_fill(rank_order_sized(profile), profile, false);
++        std::printf("filled %d, guard refusals %d, overlap %d, pair-0 %s\n", o.filled, o.guard_refusals,
++                    o.overlap_slots, o.pair0_ok ? "PASS" : "FAIL");
++        if (o.overlap_slots != 0 || !o.pair0_ok || o.guard_refusals != 0) ++bad;
++    }
++
++    std::printf("== 4. uniform slots < layers: empty ranges admit nothing, no crash ==\n");
++    {
++        const int few = 10;                       // 10 layers, 4 uniform slots
++        ExpertCache xc;
++        std::string err;
++        std::vector<uint8_t> blob((size_t) 4096, 0xAB);
++        if (!xc.open(few, few, kExperts, 4096, err)) { std::printf("open failed: %s\n", err.c_str()); ++bad; }
++        else {
++            xc.set_per_layer_admission(true);
++            int admitted = 0, refused = 0;
++            for (int l = 0; l < few; ++l) {
++                const int32_t s = xc.admit(l, 0);
++                if (s == kNotResident) { ++refused; continue; }
++                if (!xc.fill_slot_blocking(s, blob.data(), err, 4096)) { std::printf("fill: %s\n", err.c_str()); ++bad; break; }
++                ++admitted;
++            }
++            std::printf("admitted %d, refused %d (q=%d, last layer owns all %d)\n", admitted, refused, few / few == 1 ? 1 : 0, few);
++            if (admitted > few || admitted + refused != few) ++bad;
++        }
++    }
++
++    std::printf("== 5. duplicate admit maps to the same slot ==\n");
++    {
++        ExpertCache xc;
++        std::string err;
++        std::vector<uint8_t> blob((size_t) 2048, 0x5A);
++        if (!xc.open(4, 2, kExperts, 2048, err)) { std::printf("open failed: %s\n", err.c_str()); ++bad; }
++        else {
++            const int32_t a = xc.admit(0, 3), b = xc.admit(0, 3);
++            std::printf("first=%d second=%d %s\n", a, b, a == b ? "SAME" : "DIFFERENT");
++            if (a == kNotResident || a != b) ++bad;
++            else {
++                if (!xc.fill_slot_blocking(a, blob.data(), err, 2048) ||
++                    !xc.fill_slot_blocking(b, blob.data(), err, 2048) ||
++                    !xc.verify_slot(a, blob.data(), err, 2048)) { std::printf("refill/verify: %s\n", err.c_str()); ++bad; }
++            }
++        }
++    }
++
++    std::printf("== 6. bytes > blob_ is refused, not truncated ==\n");
++    {
++        ExpertCache xc;
++        std::string err;
++        std::vector<uint8_t> blob((size_t) 8192, 0);
++        if (!xc.open(4, 2, kExperts, 2048, err)) { std::printf("open failed: %s\n", err.c_str()); ++bad; }
++        else {
++            const int32_t s = xc.admit(0, 0);
++            const bool ok = xc.fill_slot_blocking(s, blob.data(), err, 4096);   // 4096 > blob_ 2048
++            std::printf("fill(4096 into 2048 slots) -> %s: %s\n", ok ? "ACCEPTED (WRONG)" : "refused", err.c_str());
++            if (ok) ++bad;
++        }
++    }
++
++    std::printf("== 7. readback rejects oversized/null input and detects corruption ==\n");
++    {
++        ExpertCache xc;
++        std::string err;
++        std::vector<uint8_t> blob(4096, 0x5A);
++        if (!xc.open(4, 2, kExperts, 2048, err)) { std::printf("open failed: %s\n", err.c_str()); ++bad; }
++        else {
++            const int32_t slot = xc.admit(0, 0);
++            if (!xc.fill_slot_blocking(slot, blob.data(), err, 2048)) ++bad;
++            const bool oversized = xc.verify_slot(slot, blob.data(), err, 4096);
++            const bool null_source = xc.verify_slot(slot, nullptr, err, 2048);
++            blob[17] ^= 1;
++            const bool corrupt = xc.verify_slot(slot, blob.data(), err, 2048);
++            std::printf("oversized=%s null=%s corruption=%s\n", oversized ? "WRONG" : "refused",
++                        null_source ? "WRONG" : "refused", corrupt ? "MISSED" : "detected");
++            if (oversized || null_source || corrupt) ++bad;
++        }
++    }
++    std::printf(bad == 0 ? "SIZED-CACHE TEST: PASS\n" : "SIZED-CACHE TEST: %d section(s) wrong\n", bad);
++    return bad == 0 ? 0 : 1;
++}
