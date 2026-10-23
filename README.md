@@ -2,11 +2,52 @@
 
 [中文](README.zh-CN.md) · [Benchmark notes](docs/BENCHMARKS.md) · [Upstream Strata](https://github.com/Niko1221/Strata)
 
-**Qwen3.8-Flash-Next on one Tesla V100 32GB: MTP acceleration, 8K–256K contexts, Vision, an OpenAI-compatible API, and Windows web service controls.**
+**One Tesla V100 32GB, Qwen3.8-Flash-Next, and up to 89.6 tok/s on the latest strict-JSON screen.**
 
-This project publishes measurements from an **i9-13900F + DDR4 + PCIe Gen3 x4 + Windows** workstation and packages portable service tools and source patches. Strata provides the inference engine. v0.1.38 is the current baseline; pinned v0.1.39 is under qualification.
+This project records real single-V100 measurements and publishes portable service tools. The newest local measurements use **Linux / Strata v0.1.41**; earlier **i9-13900F + DDR4 + PCIe Gen3 x4 + Windows** measurements and published tools are preserved as historical material. Strata provides the inference engine.
 
 ## Measured results
+
+### Linux update · 2026-10-23 — this V100 still has plenty to give
+
+**One 32GB V100, strict JSON at 89.6 tok/s, and an 8,216-token document task at 87.7 tok/s.** These are measured candidate results, not an estimate from another GPU.
+
+The current local lane is **Ubuntu 26.04.1 + Xeon E5-1650 v4 (6 cores / 12 threads) + 1× Tesla V100-PCIE-32GB**, running **Strata v0.1.41 / Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS**. The old Windows/i9 measurements below are a separate host and protocol; their difference is not a migration speedup.
+
+The frozen **October 15 tuned, ESP-off** reference uses three repetitions per task; all 12 reference answers passed the strict task checks:
+
+| Frozen reference task | Median engine decode |
+|---|---:|
+| Chinese story | **61.58 tok/s** |
+| Code | **71.66 tok/s** |
+| Strict JSON | **87.23 tok/s** |
+| 8K document | **84.47 tok/s** |
+
+The latest full-sequence screen used the original warmup → story → code → JSON → 8K order. Only SM70 table lookup was switched:
+
+| Task | SM70=0 | SM70=1 | Strict quality |
+|---|---:|---:|---|
+| Code | 69.6 | **70.4 tok/s** | Both pass |
+| JSON · 402 output tokens | 86.5 | **89.6 tok/s** | Both pass; identical text |
+| 8K document · 170 output tokens | 83.8 | **87.7 tok/s** | Both pass; identical text |
+
+This screen has one observation per task/arm. The candidate story failed strict semantic checks and is excluded from the speed highlights; code remains below its frozen reference. **We do not claim an overall four-task improvement or a new production median.** The 8K task has 8,216 input tokens; a configured 256K context is not a 256K-input benchmark.
+
+**A small, exact-output SM70 win:** a later reverse-order pair (SM70 on → off), with warmup + JSON + 8K per arm, used only six calls including warmups:
+
+| Task | Off → on decode | Full request wait, off → on |
+|---|---:|---:|
+| JSON · same 402-token answer | 78.7 → **81.3 tok/s (+3.30%)** | 6.299 → **6.167 s** |
+| 8K · same 170-token answer | 83.0 → **86.3 tok/s (+3.98%)** | 8.070 → **8.020 s** |
+
+All four measured answers passed strict task checks, with identical full-text hashes and token counts within each pair. This shorter sequence changes expert-residency history, so it is a separate workload. TTFT rose by about 31 ms / 29 ms; the decode gain is larger than the full-request gain. Existing SM70 component tests and 64 real-activation replays were bitwise equal; controlled same-width teacher-forced comparisons also matched the recorded scores and local raw top-two logits. These checks have finite coverage. SM70 remains an optional candidate, not the production default.
+
+**CPU research, also bit-exact:** the isolated IQ3_S index optimization matched all 31 captured CPU batches. In the 27 affected batches, median batch latency fell **11.12% hot / 9.13% cold**. This is a CPU microbenchmark, not an end-to-end speedup; hot-tail regressions are retained and the custom library is not deployed.
+
+Shared Linux conditions: 256K configured context, Vision ON, **native ESP off (`cvec=0`)**, conversation cache off, **15,329 actual expert slots**, MTP maximum 3, six workers, INT8 KV/resident 32,768, adaptive 1/160/0.97, CPU share 0 and PCIe fraction 0.55. [Method and boundaries](docs/BENCHMARKS.md#linux-update--2026-10-23).
+
+This update publishes documentation only. Linux launcher changes, candidate kernels, model assets and private run logs are not uploaded. Production retains the established ESP-on profile; the figures above are the explicitly separate ESP-off research lane.
+
 
 ### First controlled v0.1.38 / v0.1.39 pair · 2026-10-05
 
@@ -50,7 +91,7 @@ v0.1.38, Vision/ESP ON, static 13,317 resident experts, adapt0, MTP T=3, 23 work
 
 The two tables use different tasks, sampling and cache policies, so their difference does not establish a performance regression or gain. The latest checks retain complete request and generation-segment accounting. They are earlier single-version observations; the new controlled version pair is shown above. See [benchmark notes](docs/BENCHMARKS.md).
 
-## Tested hardware and model
+## Historical Windows hardware and model · 2026-10-05
 
 | Component | Configuration |
 |---|---|
@@ -66,7 +107,7 @@ The two tables use different tasks, sampling and cache policies, so their differ
 
 An RTX 3080 handles desktop work and is excluded from this inference lane. GPU, PCIe, CPU, RAM and OS facts were rechecked during the current test window.
 
-## Working capabilities
+## Published Windows toolkit capabilities
 
 - **Text / Vision profiles:** 8K, 32K, 64K, 128K and 256K. Context and vision loading are fixed at startup.
 - **Request-level Thinking and ESP:** client-selected reasoning effort; ESP loaded through the startup profile and switchable through web/API requests. Explicit request parameters override shared defaults.
@@ -76,7 +117,7 @@ An RTX 3080 handles desktop work and is excluded from this inference lane. GPU, 
 
 ESP is experimental and may change output behavior. The measurements do not establish zero quality impact.
 
-## Qualification status
+## Historical Windows qualification status · 2026-10-05
 
 A ten-task **128K long-document retrieval screen** has been recorded, alongside Chinese, code and tool baseline/candidate reviews. Manual code review identified a missing requested complexity explanation; general quality acceptance remains open. Pinned v0.1.39 source has built and loaded, followed by a real rollback to v0.1.38 with Vision, ESP switching and persistent usage checks. The one-hour baseline observation was interrupted after 49.1 minutes with 34 successful recorded requests and no completion summary; it did not pass. The new controlled short pair is complete. Balanced quality, reasoning and 1h/24h stability acceptance remain open.
 

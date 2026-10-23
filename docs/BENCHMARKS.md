@@ -1,6 +1,48 @@
 # Benchmark evidence and limits
 
-This page records selected, sanitized measurements from the V100 lane. It separates an older fixed-output cache-warm context matrix from the new short natural-request sample. Those older batches are separate from the new controlled v138/v139 pair below.
+This page separates the latest Linux measurements from historical Windows benchmarks. Each table keeps its own host, protocol, completion/quality criteria and sampling limits.
+
+
+## Linux update · 2026-10-23
+
+The current Linux measurement host is a Tesla V100-PCIE-32GB plus Xeon E5-1650 v4 (6 physical cores / 12 threads), Ubuntu 26.04.1. Strata remains v0.1.41; model GSQ-RCO IQ3_XXS, Qwen3.8-Flash-Next. This is a separate lane from the historical Windows/i9 system below. No cross-host speedup is inferred.
+
+### Frozen reference versus latest screen
+
+The reference is the October 15 tuned ESP-off run, three repetitions per original task, with 12/12 strict task checks passed. Frozen engine-decode medians are story **61.57900738694677**, code **71.664992020805**, JSON **87.23011825973744**, and 8K **84.472049689441 tok/s**. They have not been lowered.
+
+The latest full-sequence screen used the original warmup → story → code → JSON → 8K order, one measurement per task/arm. SM70 off/on decode was code 69.6/70.4, JSON 86.5/89.6, and 8K 83.8/87.7 tok/s. Code, JSON and 8K passed strict checks on both arms; JSON and 8K had identical text. Candidate story failed strict semantic checks, so its rate is not a qualified speed result. Code was below the frozen floor. This screen does not certify an overall four-task gain or new medians.
+
+Shared research conditions: configured context 262,144, Vision enabled, native ESP disabled (`cvec=0`), conversation cache disabled, **15,329 actually reported expert slots**, MTP maximum 3, six workers, INT8 KV with resident 32,768, adaptive every 1 / swaps 160 / decay .97, CPU share 0, PCIe fraction .55. Requests, per-task seeds, sampling and budgets were fixed; reasoning none, temperature 0. The 8K fixture has **8,216 input tokens**. A 256K configuration is not a 256K-input or 256K-quality result. Current production retains ESP and a 2GiB conversation cache; do not present these research rates as production-profile guarantees.
+
+The unchanged production engine SHA256 is `42c551ebfd4a061b8da77b28be5207971f8eadb7e3051738e992267fe756e609`.
+
+### Six-call reverse-order SM70 subset
+
+To limit cost, the later subset used **SM70 on → off**, with one original warmup, JSON and 8K per arm: **six calls including two warmups**, zero retries. Deleting the story/code prehistory changes expert residency, so it is not another repetition of the full four-task protocol.
+
+| Task | Off / on decode tok/s | Off / on full wait s | Off / on TTFT s | Output |
+|---|---:|---:|---:|---|
+| JSON | 78.7 / **81.3** | 6.298563 / **6.167238** | 1.196565 / 1.227669 | 402 tokens, identical full text |
+| 8K | 83.0 / **86.3** | 8.070262 / **8.020332** | 6.028942 / 6.057482 | 170 tokens, identical full text |
+
+All four task answers passed strict checks. Same-batch decode gains were **3.304% / 3.976%**; full wait fell **2.085% / 0.619%**. TTFT increased slightly. The shorter workflow must not be compared directly to the historical absolute floor to diagnose a regression, and it cannot replace story/code acceptance. Opposite arm orders with different request prehistories do not eliminate order effects. This is a small observed benefit, not a statistical or universal speed guarantee.
+
+Three prior batches showed lower mean GPU-reach wait in all 24 request pairs; the batch-specific observed changes ranged from -0.53 to -1.41 ms/window. These are per-request means, not independent per-window samples or confidence intervals. R8 used ESP ON/15,331 slots; later gate1b and the full-sequence screen used cvec0/cache0/15,329 slots. Their intervals must not be pooled as identical conditions. GPU-reach wait is not pure GPU kernel time.
+
+### Numerical checks and deployment boundary
+
+- SM70 tested dequantization/mmvq cases were bitwise equal; 64 real-activation GPU expert groups were also bitwise equal.
+- A fixed 657-token sequence was teacher-forced in controlled widths T3/T5. At each width, SM70 off/on matched 656 recorded target logprobs and top-one IDs, plus the locally captured raw top-two logits. Target logprobs were logged to nine decimals; this is not whole-vocabulary bitwise proof.
+- Cross-width T3/T5 differences remain a separate known limitation. They are not a permitted-error threshold for a candidate and are not resolved by the SM70 checks.
+- An isolated exact IQ3_S integer-index optimization matched 524,288 index cases, 24,320 real gate/up dot rows, and 31 captured CPU batches. Of 31 batches, 27 exercised the changed singleton path: median batch latency changed -11.124% hot / -9.127% cold. Hot results included regressions, with one +51.82% case. These are sampled CPU-only microbenchmarks, not end-to-end speedup.
+- Neither the experimental CPU library nor SM70=1 is deployed as the production default. The latest documentation decision supports considering SM70 as a reversible optimization without reopening a large model-test matrix; it does not claim the original four-task target has been met.
+- This GitHub update contains documentation only. Linux service changes, candidate code, weights, authentication material, usage databases and private captures remain outside this update.
+
+---
+
+The sections below are **historical Windows measurements and qualification notes from October 5**. They retain their original protocol and are not the current Linux production status.
+
 
 ## Historical v0.1.38 context matrix
 
